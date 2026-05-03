@@ -74,6 +74,8 @@ ANTHROPIC_API_KEY         = os.environ.get("ANTHROPIC_API_KEY", "")
 GOOGLE_CREDENTIALS_JSON   = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
 GOOGLE_SHEET_ID           = os.environ.get("GOOGLE_SHEET_ID", "")
 FOUNDER_LINE_USER_ID      = os.environ.get("FOUNDER_LINE_USER_ID", "")
+# 一次性密碼認領：業主在 LINE 傳 "admin [密碼]" 即可自助完成 admin 綁定
+ADMIN_SETUP_PASSWORD      = os.environ.get("ADMIN_SETUP_PASSWORD", "")
 
 LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
 LINE_PUSH_URL  = "https://api.line.me/v2/bot/message/push"
@@ -108,6 +110,14 @@ paused_users: set[str] = set()
 pending_prompt_update: dict[str, str] = {}
 
 MAX_HISTORY = 20  # 每位用戶保留的最大對話輪數
+
+# ── 管理員清單（in-memory，啟動時從 env + Sheets 載入） ───────────────────────
+# 支援多管理員：逗號分隔多個 user_id
+_admin_ids: set[str] = set(
+    uid.strip()
+    for uid in FOUNDER_LINE_USER_ID.split(",")
+    if uid.strip().startswith("U")
+)
 
 
 # ── Google Sheets 連線（懶載入） ──────────────────────────────────────────────
@@ -159,6 +169,67 @@ def read_settings() -> dict:
     except Exception as e:
         log.error("讀取設定失敗: %s", e)
         return {}
+
+
+def load_admin_ids() -> None:
+    """
+    從 Sheets 設定分頁讀取 ADMIN_USER_IDS（逗號分隔），
+    合併環境變數中的 FOUNDER_LINE_USER_ID，更新全域 _admin_ids。
+    """
+    global _admin_ids
+    base = set(
+        uid.strip()
+        for uid in FOUNDER_LINE_USER_ID.split(",")
+        if uid.strip().startswith("U")
+    )
+    settings = read_settings()
+    sheets_ids = set(
+        uid.strip()
+        for uid in settings.get("ADMIN_USER_IDS", "").split(",")
+        if uid.strip().startswith("U")
+    )
+    _admin_ids = base | sheets_ids
+    log.info("管理員清單已載入：%d 人 → %s", len(_admin_ids), _admin_ids)
+
+
+def is_admin(user_id: str) -> bool:
+    """判斷是否為管理員"""
+    return user_id in _admin_ids
+
+
+def add_admin(user_id: str) -> bool:
+    """
+    將 user_id 加入管理員清單，並同步寫入 Sheets 設定分頁（ADMIN_USER_IDS）。
+    回傳是否成功寫入 Sheets。
+    """
+    global _admin_ids
+    _admin_ids.add(user_id)
+    # 同步寫入 Sheets，排除環境變數已有的 id，只存 Sheets 額外追加的
+    base = set(
+        uid.strip()
+        for uid in FOUNDER_LINE_USER_ID.split(",")
+        if uid.strip().startswith("U")
+    )
+    extra = _admin_ids - base
+    return write_setting("ADMIN_USER_IDS", ",".join(sorted(extra)))
+
+
+def remove_admin(user_id: str) -> bool:
+    """
+    從管理員清單移除 user_id，同步更新 Sheets。
+    注意：無法移除環境變數 FOUNDER_LINE_USER_ID 中的 id。
+    """
+    global _admin_ids
+    base = set(
+        uid.strip()
+        for uid in FOUNDER_LINE_USER_ID.split(",")
+        if uid.strip().startswith("U")
+    )
+    if user_id in base:
+        return False  # 環境變數設定的 admin 不允許透過指令移除
+    _admin_ids.discard(user_id)
+    extra = _admin_ids - base
+    return write_setting("ADMIN_USER_IDS", ",".join(sorted(extra)))
 
 
 def write_setting(key: str, value: str) -> bool:
@@ -668,6 +739,9 @@ reload — 重新載入知識庫與設定
 pause [user_id] — 暫停特定用戶的 AI 回應
 resume [user_id] — 恢復特定用戶的 AI 回應
 reply [user_id] [訊息] — 代傳訊息給用戶（relay 模式）
+listadmin — 查看目前所有管理員
+addadmin [user_id] — 新增管理員
+removeadmin [user_id] — 移除管理員（環境變數設定的無法移除）
 help — 顯示此說明"""
 
 
@@ -705,7 +779,8 @@ def handle_admin(user_id: str, text: str) -> str:
     # ── reload ────────────────────────────────────────────────────────────────
     if text_lower == "reload":
         load_system_prompt()
-        return f"已重新載入知識庫與設定。\nSYSTEM_PROMPT 長度：{len(get_system_prompt())} 字"
+        load_admin_ids()
+        return f"已重新載入知識庫、設定與管理員清單。\nSYSTEM_PROMPT 長度：{len(get_system_prompt())} 字\n管理員：{len(_admin_ids)} 人"
 
     # ── report ────────────────────────────────────────────────────────────────
     if text_lower == "report":
@@ -772,6 +847,40 @@ def handle_admin(user_id: str, text: str) -> str:
         log_conversation(target_id, "[業主 relay]", relay_msg, "RELAY")
         return f"已代傳給 {target_id}。"
 
+    # ── listadmin ─────────────────────────────────────────────────────────────
+    if text_lower == "listadmin":
+        ids = sorted(_admin_ids)
+        base = set(
+            uid.strip()
+            for uid in FOUNDER_LINE_USER_ID.split(",")
+            if uid.strip().startswith("U")
+        )
+        lines = []
+        for uid in ids:
+            tag = "（環境變數）" if uid in base else "（Sheets）"
+            lines.append(f"{uid} {tag}")
+        return f"目前管理員（{len(ids)} 人）：\n" + "\n".join(lines) if lines else "尚無管理員設定。"
+
+    # ── addadmin [user_id] ────────────────────────────────────────────────────
+    if text_lower.startswith("addadmin "):
+        target = original[9:].strip()
+        if not target.startswith("U"):
+            return f"user_id 格式錯誤（應為 Uxxxxxx），收到：{target}"
+        if target in _admin_ids:
+            return f"{target} 已經是管理員。"
+        ok = add_admin(target)
+        return f"已新增管理員：{target}" + ("" if ok else "\n（注意：Sheets 同步失敗，重啟後將失效，請手動更新 Sheets ADMIN_USER_IDS）")
+
+    # ── removeadmin [user_id] ─────────────────────────────────────────────────
+    if text_lower.startswith("removeadmin "):
+        target = original[12:].strip()
+        if not target.startswith("U"):
+            return f"user_id 格式錯誤（應為 Uxxxxxx），收到：{target}"
+        result = remove_admin(target)
+        if result is False:
+            return f"{target} 是透過環境變數設定的管理員，無法透過指令移除。請在 Railway 修改 FOUNDER_LINE_USER_ID。"
+        return f"已移除管理員：{target}"
+
     # ── 未知指令 ──────────────────────────────────────────────────────────────
     return f"不認識這個指令。輸入 help 查看可用指令。\n（收到：{original[:50]}）"
 
@@ -832,8 +941,24 @@ def webhook():
 
             log.info("MSG from %s: %s", user_id, user_text[:80])
 
+            # ── 一次性密碼認領（任何人皆可觸發，成功後加入管理員）────────────
+            if (ADMIN_SETUP_PASSWORD
+                    and user_text.strip().lower().startswith("admin ")
+                    and not is_admin(user_id)):
+                pw_input = user_text.strip()[6:].strip()
+                if pw_input == ADMIN_SETUP_PASSWORD:
+                    add_admin(user_id)
+                    line_reply(reply_token,
+                        "管理員身份已確認，歡迎使用管理模式。\n傳送 help 查看可用指令。")
+                    log.info("新管理員透過密碼認領：%s", user_id)
+                else:
+                    line_reply(reply_token, "密碼錯誤。")
+                    log.warning("密碼認領失敗（錯誤密碼）：%s", user_id)
+                # 密碼訊息不寫入 Sheets，直接 continue
+                continue
+
             # ── Admin 模式（模組 7-3）────────────────────────────────────────
-            if FOUNDER_LINE_USER_ID and user_id == FOUNDER_LINE_USER_ID:
+            if is_admin(user_id):
                 response = handle_admin(user_id, user_text)
                 # Admin 回應用 Push（避免超過 5 秒 webhook timeout）
                 line_push(user_id, response)
@@ -908,6 +1033,9 @@ if __name__ == "__main__":
     # 初始化 SYSTEM_PROMPT（從 Sheets 載入）
     load_system_prompt()
 
+    # 載入管理員清單（env + Sheets）
+    load_admin_ids()
+
     # 啟動每日報告排程
     init_scheduler()
 
@@ -916,4 +1044,5 @@ if __name__ == "__main__":
 else:
     # gunicorn 啟動時也要初始化
     load_system_prompt()
+    load_admin_ids()
     init_scheduler()
