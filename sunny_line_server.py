@@ -855,8 +855,20 @@ def get_dynamic_system_prompt(user_id: str, user_message: str) -> str:
     """根據訊息內容動態組合 SYSTEM_PROMPT，注入 user_id 與預約時段"""
     base = get_system_prompt()
 
-    # 永遠注入當前用戶的 LINE user_id，確保 AI 能正確生成 ESCALATE tag
-    user_ctx = f"\n\n# 當前用戶資訊\n當前對話的用戶 LINE ID：{user_id}\n（ESCALATE tag 請直接使用此 ID）"
+    # 永遠注入當前用戶的 LINE user_id，確保 AI 能正確生成 ESCALATE/NOTIFY tag
+    user_ctx = (
+        f"\n\n# 當前用戶資訊\n"
+        f"當前對話的用戶 LINE ID：{user_id}\n\n"
+        f"# 升級標記使用規則\n\n"
+        f"## ESCALATE（硬升級）：用戶將被暫停 AI 回應，等待業主人工介入\n"
+        f"觸發條件：客訴／強烈不滿、明確要求真人服務、費用議價、商業合作等需要業主直接處理的情況\n"
+        f"格式（放在回覆末尾，用戶看不到）：ESCALATE:user_id:{user_id}\n\n"
+        f"## NOTIFY（軟通知）：僅通知業主，用戶的 AI 回應正常繼續\n"
+        f"觸發條件：AI 無法回答的知識空缺（如知識庫沒有的特殊服務、超出 AI 判斷範圍的細節問題）\n"
+        f"格式（放在回覆末尾，用戶看不到）：NOTIFY:reason:[簡短說明原因，30字以內]\n"
+        f"注意：NOTIFY 後用戶仍可繼續與 AI 對話，不需暫停\n\n"
+        f"重要：兩種標記不可同時使用；優先判斷是否需要 ESCALATE，否則才考慮 NOTIFY"
+    )
     base = base + user_ctx
 
     if not is_booking_context(user_id, user_message):
@@ -1053,6 +1065,17 @@ def call_claude(user_id: str, user_message: str) -> tuple[str, str]:
             log.warning("CHANGE_FAIL: %s → %s", f"{c_old_date} {c_old_start}-{c_old_end}",
                         f"{c_new_date} {c_new_start}-{c_new_end}")
 
+    # ── 偵測 NOTIFY 標記（軟通知，不暫停用戶）────────────────────────────────
+    notify_match = re.search(r"NOTIFY:reason:([^\n]{1,60})", reply_text)
+    if notify_match and status == "OK":
+        status = "NOTIFY"
+        _notify_reason = notify_match.group(1).strip()
+        reply_text = re.sub(r"\s*NOTIFY:reason:[^\n]+", "", reply_text).strip()
+        # handle_notify 在 webhook handler 中呼叫（需要 trigger_text）
+        # 這裡先把原因存進 thread-safe 方式：用 return 值帶出
+        # 做法：在 status 欄位帶入 reason，格式 "NOTIFY:[reason]"
+        status = f"NOTIFY:{_notify_reason}"
+
     # ── 偵測 ESCALATE 標記 ────────────────────────────────────────────────────
     # 主要格式：ESCALATE:user_id:Uxxxxxx（AI 從注入的 user_id 填入）
     # 降級格式：任何含 ESCALATE:user_id: 的輸出（AI 格式錯誤時也能捕捉）
@@ -1064,7 +1087,9 @@ def call_claude(user_id: str, user_message: str) -> tuple[str, str]:
 
     history.append({"role": "assistant", "content": reply_text})
     set_history(user_id, history)   # 寫回 Redis（持久化）
-    log_conversation(user_id, user_message, reply_text, status)
+    # 對話記錄 Sheets 的狀態欄只寫主類型（NOTIFY:[reason] → NOTIFY）
+    log_status = status.split(":")[0] if status.startswith("NOTIFY:") else status
+    log_conversation(user_id, user_message, reply_text, log_status)
     return reply_text, status
 
 
@@ -1462,7 +1487,43 @@ def handle_admin(user_id: str, text: str) -> str:
     return f"不認識這個指令。輸入 help 查看可用指令。\n（收到：{original[:50]}）"
 
 
-# ── 模組 7-7：ESCALATE 升級通知 ──────────────────────────────────────────────
+# ── 模組 7-7：升級通知（NOTIFY 軟通知 + ESCALATE 硬升級）────────────────────
+
+def handle_notify(notify_user_id: str, trigger_text: str, reason: str) -> None:
+    """
+    NOTIFY 軟通知流程：
+    1. 寫入 Sheets 例外記錄（觸發分類：知識空缺）
+    2. Push 通知所有管理員（提示 AI 無法回答，供補充知識庫）
+    3. 用戶的 AI 回應正常送出，不暫停
+    """
+    sheet = get_sheet(SHEET_ESCALATE)
+    if sheet:
+        try:
+            sheet.append_row([
+                datetime.now().isoformat(),
+                notify_user_id,
+                trigger_text[:200],
+                "知識空缺",
+                "未處理",
+                "",
+            ])
+        except Exception as e:
+            log.error("NOTIFY 寫入例外記錄失敗: %s", e)
+
+    notify_msg = (
+        f"💬 知識空缺通知\n"
+        f"AI 無法完整回答此問題，建議補充知識庫\n"
+        f"原因：{reason}\n"
+        f"觸發訊息：{trigger_text[:80]}\n"
+        f"用戶ID：{notify_user_id}\n\n"
+        f"（用戶 AI 回應已正常送出，無需人工介入）\n"
+        f"若需回覆可用：reply {notify_user_id} [你的補充]"
+    )
+    for admin_id in _admin_ids:
+        line_push(admin_id, notify_msg)
+    log.info("NOTIFY: user %s [知識空缺] reason=%s → notified %d admin(s)",
+             notify_user_id, reason[:40], len(_admin_ids))
+
 
 def handle_escalate(escalate_user_id: str, trigger_text: str) -> None:
     """
@@ -1556,8 +1617,13 @@ def webhook():
             line_reply(reply_token, reply_text)
             log.info("REPLY to %s [%s]: %s", user_id, status, reply_text[:80])
 
-            # ── ESCALATE 處理（模組 7-7）─────────────────────────────────────
-            if status == "ESCALATE":
+            # ── NOTIFY 處理（模組 7-7，軟通知）─────────────────────────────────
+            if status.startswith("NOTIFY:"):
+                _reason = status[len("NOTIFY:"):]
+                handle_notify(user_id, user_text, _reason)
+
+            # ── ESCALATE 處理（模組 7-7，硬升級）────────────────────────────────
+            elif status == "ESCALATE":
                 handle_escalate(user_id, user_text)
 
         # ── 加入好友事件 ──────────────────────────────────────────────────────
