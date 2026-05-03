@@ -6,3 +6,4 @@ gunicorn==23.0.0
 gspread==6.1.2
 google-auth==2.29.0
 APScheduler==3.10.4
+redis==5.0.8

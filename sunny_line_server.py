@@ -62,6 +62,13 @@ try:
 except ImportError:
     GSPREAD_AVAILABLE = False
 
+# Redis
+try:
+    import redis as redis_lib
+    REDIS_AVAILABLE = True
+except ImportError:
+    REDIS_AVAILABLE = False
+
 
 # ── 環境變數 ──────────────────────────────────────────────────────────────────
 
@@ -76,6 +83,7 @@ GOOGLE_SHEET_ID           = os.environ.get("GOOGLE_SHEET_ID", "")
 FOUNDER_LINE_USER_ID      = os.environ.get("FOUNDER_LINE_USER_ID", "")
 # 一次性密碼認領：業主在 LINE 傳 "admin [密碼]" 即可自助完成 admin 綁定
 ADMIN_SETUP_PASSWORD      = os.environ.get("ADMIN_SETUP_PASSWORD", "")
+REDIS_URL                 = os.environ.get("REDIS_URL", "")
 
 LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
 LINE_PUSH_URL  = "https://api.line.me/v2/bot/message/push"
@@ -101,15 +109,130 @@ log = logging.getLogger(__name__)
 claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 
-# ── 全域狀態（in-memory） ──────────────────────────────────────────────────────
+# ── Redis 連線 ────────────────────────────────────────────────────────────────
 
-conversation_history: dict[str, list[dict]] = defaultdict(list)
-# ESCALATE 後被暫停的用戶（重啟後清空；如需持久化，讀寫 SHEET_PAUSED）
-paused_users: set[str] = set()
+_redis_client = None
+
+def get_redis():
+    """取得 Redis 連線，失敗回傳 None（降級為 in-memory）"""
+    global _redis_client
+    if _redis_client is not None:
+        return _redis_client
+    if not REDIS_AVAILABLE or not REDIS_URL:
+        return None
+    try:
+        _redis_client = redis_lib.from_url(REDIS_URL, decode_responses=True, socket_timeout=3)
+        _redis_client.ping()
+        log.info("Redis 連線成功：%s", REDIS_URL.split("@")[-1])
+    except Exception as e:
+        log.warning("Redis 連線失敗，降級使用 in-memory：%s", e)
+        _redis_client = None
+    return _redis_client
+
+
+# ── 對話歷史存取（Redis 優先，降級 in-memory） ────────────────────────────────
+
+HISTORY_TTL = 60 * 60 * 24 * 7   # Redis key 保留 7 天
+MAX_HISTORY  = 20                  # 每位用戶保留的最大對話輪數（條數）
+
+_mem_history: dict[str, list[dict]] = defaultdict(list)   # in-memory 降級備用
+
+
+def get_history(user_id: str) -> list[dict]:
+    """讀取用戶對話歷史（Redis → in-memory 降級）"""
+    r = get_redis()
+    if r:
+        try:
+            raw = r.get(f"hist:{user_id}")
+            return json.loads(raw) if raw else []
+        except Exception as e:
+            log.warning("Redis get_history 失敗：%s", e)
+    return list(_mem_history[user_id])
+
+
+def set_history(user_id: str, history: list[dict]) -> None:
+    """寫入用戶對話歷史（Redis → in-memory 降級）"""
+    r = get_redis()
+    if r:
+        try:
+            r.setex(f"hist:{user_id}", HISTORY_TTL, json.dumps(history, ensure_ascii=False))
+            return
+        except Exception as e:
+            log.warning("Redis set_history 失敗：%s", e)
+    _mem_history[user_id] = history
+
+
+def clear_history(user_id: str) -> None:
+    """清除用戶對話歷史"""
+    r = get_redis()
+    if r:
+        try:
+            r.delete(f"hist:{user_id}")
+        except Exception:
+            pass
+    _mem_history.pop(user_id, None)
+
+
+# ── 暫停用戶存取（Redis 優先，降級 in-memory） ────────────────────────────────
+
+_mem_paused: set[str] = set()
+
+
+def is_paused(user_id: str) -> bool:
+    r = get_redis()
+    if r:
+        try:
+            return bool(r.sismember("paused_users", user_id))
+        except Exception:
+            pass
+    return user_id in _mem_paused
+
+
+def pause_user(user_id: str) -> None:
+    r = get_redis()
+    if r:
+        try:
+            r.sadd("paused_users", user_id)
+            return
+        except Exception:
+            pass
+    _mem_paused.add(user_id)
+
+
+def resume_user(user_id: str) -> None:
+    r = get_redis()
+    if r:
+        try:
+            r.srem("paused_users", user_id)
+            return
+        except Exception:
+            pass
+    _mem_paused.discard(user_id)
+
+
+def get_paused_count() -> int:
+    r = get_redis()
+    if r:
+        try:
+            return r.scard("paused_users")
+        except Exception:
+            pass
+    return len(_mem_paused)
+
+
+# ── 全域狀態（in-memory，不需要持久化的部分） ────────────────────────────────
+
 # 等待業主 confirm/cancel 的提示詞更新（key = admin user_id）
 pending_prompt_update: dict[str, str] = {}
 
-MAX_HISTORY = 20  # 每位用戶保留的最大對話輪數
+# 向下相容：舊程式碼用的 paused_users（代理到新函數）
+class _PausedProxy:
+    def add(self, uid): pause_user(uid)
+    def discard(self, uid): resume_user(uid)
+    def __contains__(self, uid): return is_paused(uid)
+    def __len__(self): return get_paused_count()
+
+paused_users = _PausedProxy()
 
 # ── 管理員清單（in-memory，啟動時從 env + Sheets 載入） ───────────────────────
 # 支援多管理員：逗號分隔多個 user_id
@@ -322,7 +445,7 @@ def log_conversation(
             user_text,
             reply_text,
             status,
-            len(conversation_history.get(user_id, [])),
+            len(get_history(user_id)),
         ])
     except Exception as e:
         log.error("Sheets 對話記錄寫入失敗: %s", e)
@@ -720,7 +843,7 @@ def is_booking_context(user_id: str, user_message: str) -> bool:
     """
     if is_booking_related(user_message):
         return True
-    history = conversation_history.get(user_id, [])
+    history = get_history(user_id)
     recent = history[-10:] if len(history) > 10 else history
     for msg in recent:
         if msg.get("role") == "user" and is_booking_related(msg.get("content", "")):
@@ -820,14 +943,13 @@ CHANGE:old_date:[YYYY-MM-DD]:old_start:[HH:MM]:old_end:[HH:MM]:new_date:[YYYY-MM
 
 def call_claude(user_id: str, user_message: str) -> tuple[str, str]:
     """
-    呼叫 Claude API，維護對話歷史。
-    回傳 (reply_text, status)，status = OK / ERROR / ESCALATE
+    呼叫 Claude API，維護對話歷史（Redis 持久化，重啟不遺失）。
+    回傳 (reply_text, status)，status = OK / ERROR / ESCALATE / NOTIFY
     """
-    history = conversation_history[user_id]
+    history = get_history(user_id)
     history.append({"role": "user", "content": user_message})
     if len(history) > MAX_HISTORY:
         history = history[-MAX_HISTORY:]
-        conversation_history[user_id] = history
 
     status = "OK"
     try:
@@ -941,6 +1063,7 @@ def call_claude(user_id: str, user_message: str) -> tuple[str, str]:
         reply_text = re.sub(r"\s*ESCALATE:user_id:\S+", "", reply_text).strip()
 
     history.append({"role": "assistant", "content": reply_text})
+    set_history(user_id, history)   # 寫回 Redis（持久化）
     log_conversation(user_id, user_message, reply_text, status)
     return reply_text, status
 
@@ -1098,8 +1221,9 @@ def handle_admin(user_id: str, text: str) -> str:
 
     # ── status ────────────────────────────────────────────────────────────────
     if text_lower == "status":
-        active = len(conversation_history)
-        paused = len(paused_users)
+        r = get_redis()
+        active = r.dbsize() if r else "N/A（in-memory）"
+        paused = get_paused_count()
         pending = len(pending_prompt_update)
         sheet = get_sheet(SHEET_ESCALATE)
         unhandled = 0
@@ -1456,8 +1580,8 @@ def webhook():
         # ── 封鎖事件 ──────────────────────────────────────────────────────────
         elif event_type == "unfollow":
             user_id = event["source"]["userId"]
-            conversation_history.pop(user_id, None)
-            paused_users.discard(user_id)
+            clear_history(user_id)
+            resume_user(user_id)
             log.info("Unfollowed: %s", user_id)
 
     return "OK", 200
@@ -1467,11 +1591,19 @@ def webhook():
 
 @app.route("/health", methods=["GET"])
 def health():
+    r = get_redis()
+    redis_ok = False
+    if r:
+        try:
+            r.ping()
+            redis_ok = True
+        except Exception:
+            pass
     return {
         "status": "ok",
         "time": datetime.now().isoformat(),
-        "active_users": len(conversation_history),
-        "paused_users": len(paused_users),
+        "redis": "connected" if redis_ok else "in-memory fallback",
+        "paused_users": get_paused_count(),
         "system_prompt_length": len(get_system_prompt()),
     }, 200
 
@@ -1497,9 +1629,10 @@ def admin_status():
     expected = ADMIN_SETUP_PASSWORD or LINE_CHANNEL_SECRET[:16]
     if not token or token != expected:
         return {"error": "unauthorized"}, 401
+    r = get_redis()
+    paused_list = list(r.smembers("paused_users")) if r else list(_mem_paused)
     return {
-        "paused_users": list(paused_users),
-        "active_users": len(conversation_history),
+        "paused_users": paused_list,
         "admin_ids": list(_admin_ids),
     }, 200
 
