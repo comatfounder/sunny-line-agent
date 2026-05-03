@@ -1054,20 +1054,32 @@ def init_scheduler() -> None:
 # ── 模組 7-3：Admin 指令處理 ──────────────────────────────────────────────────
 
 ADMIN_HELP = """可用指令：
+【時段管理】
+slots [日期] — 查看某天時段（例：slots 2026-05-10）
+block [日期] [開始]-[結束] — 封鎖時段（例：block 2026-05-10 14:00-17:00）
+unblock [日期] [開始]-[結束] — 還原時段（例：unblock 2026-05-10 14:00-17:00）
+
+【系統管理】
 status — 系統狀態
+reload — 重新載入知識庫與設定
 report — 今日對話摘要
 report 週 — 本週報告
 report 月 — 本月報告
+
+【AI 設定】
 update prompt [內容] — 更新提示詞（有確認流程）
 confirm — 確認提示詞更新
 cancel — 取消提示詞更新
-reload — 重新載入知識庫與設定
+
+【客服操作】
 pause [user_id] — 暫停特定用戶的 AI 回應
 resume [user_id] — 恢復特定用戶的 AI 回應
-reply [user_id] [訊息] — 代傳訊息給用戶（relay 模式）
-listadmin — 查看目前所有管理員
+reply [user_id] [訊息] — 代傳訊息給用戶
+
+【管理員】
+listadmin — 查看所有管理員
 addadmin [user_id] — 新增管理員
-removeadmin [user_id] — 移除管理員（環境變數設定的無法移除）
+removeadmin [user_id] — 移除管理員
 help — 顯示此說明"""
 
 
@@ -1206,6 +1218,113 @@ def handle_admin(user_id: str, text: str) -> str:
         if result is False:
             return f"{target} 是透過環境變數設定的管理員，無法透過指令移除。請在 Railway 修改 FOUNDER_LINE_USER_ID。"
         return f"已移除管理員：{target}"
+
+    # ── slots [日期] — 查看某天時段狀態 ─────────────────────────────────────
+    if text_lower.startswith("slots"):
+        parts = original.split(None, 1)
+        date_arg = parts[1].strip() if len(parts) > 1 else ""
+        if not date_arg:
+            return "格式：slots [日期]\n範例：slots 2026-05-10"
+        ws = get_sheet(SHEET_SLOTS)
+        if ws is None:
+            return "無法讀取時段資料，請稍後再試。"
+        try:
+            rows = ws.get_all_values()
+            day_rows = [r for r in rows[1:] if len(r) >= 4 and r[0].strip() == date_arg]
+            if not day_rows:
+                return f"{date_arg} 沒有任何時段資料。"
+            lines = [f"📅 {date_arg} 時段狀態："]
+            for r in day_rows:
+                icon = "✅" if r[3].strip() == "可預約" else "🔴"
+                lines.append(f"{icon} {r[1]}-{r[2]}  {r[3]}")
+            avail = sum(1 for r in day_rows if r[3].strip() == "可預約")
+            lines.append(f"\n可預約：{avail} 筆 / 共 {len(day_rows)} 筆")
+            return "\n".join(lines)
+        except Exception as e:
+            log.error("slots 指令失敗: %s", e)
+            return "讀取時段失敗，請稍後再試。"
+
+    # ── block [日期] [開始]-[結束] — 封鎖時段 ──────────────────────────────
+    if text_lower.startswith("block "):
+        parts = original[6:].split(None, 1)
+        if len(parts) < 2 or "-" not in parts[1]:
+            return "格式：block [日期] [開始]-[結束]\n範例：block 2026-05-10 14:00-17:00"
+        date_arg = parts[0].strip()
+        times = parts[1].strip().split("-", 1)
+        if len(times) != 2:
+            return "時間格式錯誤，請用 HH:MM-HH:MM"
+        start_arg, end_arg = times[0].strip(), times[1].strip()
+        ws = get_sheet(SHEET_SLOTS)
+        if ws is None:
+            return "無法存取時段資料。"
+        try:
+            rows = ws.get_all_values()
+            start_min = _time_to_minutes(start_arg)
+            end_min   = _time_to_minutes(end_arg)
+            blocked = []
+            already = []
+            for i, row in enumerate(rows[1:], start=2):
+                if len(row) < 4 or row[0].strip() != date_arg:
+                    continue
+                s_min = _time_to_minutes(row[1].strip())
+                e_min = _time_to_minutes(row[2].strip())
+                if s_min >= start_min and e_min <= end_min:
+                    if row[3].strip() == "可預約":
+                        ws.update_cell(i, 4, "已滿")
+                        blocked.append(f"{row[1]}-{row[2]}")
+                    else:
+                        already.append(f"{row[1]}-{row[2]}")
+            if not blocked and not already:
+                return f"找不到 {date_arg} {start_arg}-{end_arg} 範圍內的時段，請確認日期和時間。"
+            msg = f"🔴 已封鎖 {date_arg} {start_arg}-{end_arg}：\n" + "\n".join(f"  • {t}" for t in blocked)
+            if already:
+                msg += f"\n（已滿，略過：{', '.join(already)}）"
+            log.info("Admin BLOCK: %s %s-%s → %d 筆", date_arg, start_arg, end_arg, len(blocked))
+            return msg
+        except Exception as e:
+            log.error("block 指令失敗: %s", e)
+            return "封鎖失敗，請稍後再試。"
+
+    # ── unblock [日期] [開始]-[結束] — 還原時段 ────────────────────────────
+    if text_lower.startswith("unblock "):
+        parts = original[8:].split(None, 1)
+        if len(parts) < 2 or "-" not in parts[1]:
+            return "格式：unblock [日期] [開始]-[結束]\n範例：unblock 2026-05-10 14:00-17:00"
+        date_arg = parts[0].strip()
+        times = parts[1].strip().split("-", 1)
+        if len(times) != 2:
+            return "時間格式錯誤，請用 HH:MM-HH:MM"
+        start_arg, end_arg = times[0].strip(), times[1].strip()
+        ws = get_sheet(SHEET_SLOTS)
+        if ws is None:
+            return "無法存取時段資料。"
+        try:
+            rows = ws.get_all_values()
+            start_min = _time_to_minutes(start_arg)
+            end_min   = _time_to_minutes(end_arg)
+            restored = []
+            skipped  = []
+            for i, row in enumerate(rows[1:], start=2):
+                if len(row) < 4 or row[0].strip() != date_arg:
+                    continue
+                s_min = _time_to_minutes(row[1].strip())
+                e_min = _time_to_minutes(row[2].strip())
+                if s_min >= start_min and e_min <= end_min:
+                    if row[3].strip() == "已滿":
+                        ws.update_cell(i, 4, "可預約")
+                        restored.append(f"{row[1]}-{row[2]}")
+                    else:
+                        skipped.append(f"{row[1]}-{row[2]}")
+            if not restored and not skipped:
+                return f"找不到 {date_arg} {start_arg}-{end_arg} 範圍內的時段。"
+            msg = f"✅ 已還原 {date_arg} {start_arg}-{end_arg}：\n" + "\n".join(f"  • {t}" for t in restored)
+            if skipped:
+                msg += f"\n（已是可預約，略過：{', '.join(skipped)}）"
+            log.info("Admin UNBLOCK: %s %s-%s → %d 筆", date_arg, start_arg, end_arg, len(restored))
+            return msg
+        except Exception as e:
+            log.error("unblock 指令失敗: %s", e)
+            return "還原失敗，請稍後再試。"
 
     # ── 未知指令 ──────────────────────────────────────────────────────────────
     return f"不認識這個指令。輸入 help 查看可用指令。\n（收到：{original[:50]}）"
