@@ -441,14 +441,24 @@ def get_available_slots() -> list[dict]:
         return []
 
 
+def _time_to_minutes(t: str) -> int:
+    """將 HH:MM 轉成分鐘數，方便比較"""
+    h, m = map(int, t.split(":"))
+    return h * 60 + m
+
+
 def book_slot(user_id: str, date_str: str, start_t: str, end_t: str,
               name: str, contact: str) -> tuple[bool, str]:
     """
     原子性預約操作（workers=1 保證無 race condition）：
+    支援單一時段（09:00-10:00）與跨時段範圍（09:00-12:00）。
+
+    流程：
     1. 驗證日期不是過去
-    2. 找到對應 row，再次確認仍為「可預約」
-    3. 將 D 欄改為「已滿」
-    4. 寫入預約記錄
+    2. 找出 date_str 當天所有落在 [start_t, end_t) 範圍內的時段列
+    3. 確認全部都是「可預約」
+    4. 批次將這些列的 D 欄改為「已滿」
+    5. 寫入預約記錄（一筆，記錄完整時間範圍）
     回傳 (success, message)
     """
     # 驗證日期
@@ -465,24 +475,35 @@ def book_slot(user_id: str, date_str: str, start_t: str, end_t: str,
         return False, "系統暫時無法完成預約，請稍後再試"
     try:
         rows = ws_slots.get_all_values()
-        target_row = None
+        start_min = _time_to_minutes(start_t)
+        end_min   = _time_to_minutes(end_t)
+
+        # 找出當天所有落在 [start_t, end_t) 範圍內的時段
+        matched_rows: list[tuple[int, str, str, str]] = []  # (row_idx, start, end, status)
         for i, row in enumerate(rows[1:], start=2):
             if len(row) < 4:
                 continue
-            if (row[0].strip() == date_str and
-                    row[1].strip() == start_t and
-                    row[2].strip() == end_t):
-                target_row = i
-                if row[3].strip() != "可預約":
-                    return False, f"很抱歉，{date_str} {start_t}-{end_t} 這個時段剛被預約走了，請選擇其他時段。"
-                break
-        if target_row is None:
-            return False, "找不到這個時段，請確認日期和時間是否正確。"
+            if row[0].strip() != date_str:
+                continue
+            s_min = _time_to_minutes(row[1].strip())
+            e_min = _time_to_minutes(row[2].strip())
+            # 時段起點 >= booking start 且 終點 <= booking end
+            if s_min >= start_min and e_min <= end_min:
+                matched_rows.append((i, row[1].strip(), row[2].strip(), row[3].strip()))
 
-        # 標記為已滿（第 4 欄）
-        ws_slots.update_cell(target_row, 4, "已滿")
+        if not matched_rows:
+            return False, f"找不到 {date_str} {start_t}-{end_t} 的可用時段，請確認時間是否正確。"
 
-        # 寫入預約記錄
+        # 確認所有符合時段都是「可預約」
+        unavailable = [f"{s}-{e}" for _, s, e, st in matched_rows if st != "可預約"]
+        if unavailable:
+            return False, f"很抱歉，以下時段已被預約：{', '.join(unavailable)}，請選擇其他時段。"
+
+        # 批次標記為已滿
+        for row_idx, _, _, _ in matched_rows:
+            ws_slots.update_cell(row_idx, 4, "已滿")
+
+        # 寫入預約記錄（一筆，完整時間範圍）
         ws_records.append_row([
             datetime.now().isoformat(),
             user_id,
@@ -492,7 +513,9 @@ def book_slot(user_id: str, date_str: str, start_t: str, end_t: str,
             "已確認",
         ])
 
-        log.info("預約成功：%s %s-%s → %s (%s)", date_str, start_t, end_t, name, contact)
+        slots_count = len(matched_rows)
+        log.info("預約成功：%s %s-%s（%d 時段）→ %s (%s)",
+                 date_str, start_t, end_t, slots_count, name, contact)
         return True, f"已為 {name} 預約 {date_str} {start_t}-{end_t} 的拍攝時段"
     except Exception as e:
         log.error("預約操作失敗: %s", e)
@@ -523,23 +546,27 @@ def get_dynamic_system_prompt(user_message: str) -> str:
 
 {slots_text}{more}
 
+上方每筆為一個小時單位。客人可選擇連續多個時段（例如選 09:00-12:00，系統會自動鎖定 09:00-10:00、10:00-11:00、11:00-12:00 三個時段）。
+
 # 預約確認流程
 
 引導客人完成以下三步驟後才執行預約：
 步驟一：確認拍攝類型（親子、個人、全家福、情侶）
-步驟二：客人從上方時段中選擇一個
+步驟二：確認拍攝時段——客人可選單一小時或連續多小時（start 到 end 必須都在上方清單內）
 步驟三：請客人提供姓名和聯絡方式（電話或 LINE ID）
 
 三項資訊齊全後，在回覆末尾加入預約標記（客人看不到此標記）：
 BOOK:date:[YYYY-MM-DD]:start:[HH:MM]:end:[HH:MM]:name:[姓名]:contact:[聯絡方式]
 
-範例：BOOK:date:2026-05-10:start:09:00:end:11:00:name:王小明:contact:0912345678
+範例（單一時段）：BOOK:date:2026-05-10:start:09:00:end:10:00:name:王小明:contact:0912345678
+範例（連續時段）：BOOK:date:2026-05-10:start:09:00:end:12:00:name:王小明:contact:0912345678
 
 注意：
 - 嚴格使用 YYYY-MM-DD 格式填寫日期，HH:MM 格式填寫時間
-- 時段必須從上方清單中選取，不可自行創造時段
-- 確認三項資訊齊全後才輸出 BOOK 標記
-- 輸出 BOOK 標記時，同時用文字告知客人預約已完成並說明細節"""
+- start 和 end 必須完全落在上方可預約清單的邊界上（例如 09:00 開始、12:00 結束）
+- 不可選超出清單範圍的時間（例如 08:00 或 19:00）
+- 確認三項資訊齊全後才輸出 BOOK 標記，不可提前輸出
+- 輸出 BOOK 標記時，同時用文字告知客人預約細節"""
         return base + booking_ctx
     else:
         return base + """
