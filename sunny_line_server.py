@@ -526,10 +526,27 @@ def is_booking_related(text: str) -> bool:
     return any(kw in text for kw in BOOKING_KEYWORDS)
 
 
-def get_dynamic_system_prompt(user_message: str) -> str:
+def is_booking_context(user_id: str, user_message: str) -> bool:
+    """
+    判斷是否需要注入預約指示：
+    - 當前訊息含預約關鍵字，或
+    - 近 10 則對話歷史中有含預約關鍵字的 user 訊息
+    （確保「傳電話號碼」這種最後一步也能取得預約指示）
+    """
+    if is_booking_related(user_message):
+        return True
+    history = conversation_history.get(user_id, [])
+    recent = history[-10:] if len(history) > 10 else history
+    for msg in recent:
+        if msg.get("role") == "user" and is_booking_related(msg.get("content", "")):
+            return True
+    return False
+
+
+def get_dynamic_system_prompt(user_id: str, user_message: str) -> str:
     """根據訊息內容動態組合 SYSTEM_PROMPT，預約相關訊息注入即時時段"""
     base = get_system_prompt()
-    if not is_booking_related(user_message):
+    if not is_booking_context(user_id, user_message):
         return base
 
     slots = get_available_slots()
@@ -595,7 +612,7 @@ def call_claude(user_id: str, user_message: str) -> tuple[str, str]:
         response = claude_client.messages.create(
             model=CLAUDE_MODEL,
             max_tokens=1024,
-            system=get_dynamic_system_prompt(user_message),   # 動態注入時段
+            system=get_dynamic_system_prompt(user_id, user_message),   # 動態注入時段（含歷史判斷）
             messages=history,
         )
         reply_text = response.content[0].text
@@ -1044,6 +1061,34 @@ def health():
         "active_users": len(conversation_history),
         "paused_users": len(paused_users),
         "system_prompt_length": len(get_system_prompt()),
+    }, 200
+
+
+# ── 管理 API（需帶 token 驗證）────────────────────────────────────────────────
+
+@app.route("/admin/resume/<user_id>", methods=["POST"])
+def admin_resume(user_id: str):
+    """解鎖被暫停的用戶，供緊急狀況使用"""
+    token = request.headers.get("X-Admin-Token", "")
+    expected = ADMIN_SETUP_PASSWORD or LINE_CHANNEL_SECRET[:16]
+    if not token or token != expected:
+        return {"error": "unauthorized"}, 401
+    paused_users.discard(user_id)
+    log.info("HTTP admin resume: %s", user_id)
+    return {"resumed": user_id, "paused_count": len(paused_users)}, 200
+
+
+@app.route("/admin/status", methods=["GET"])
+def admin_status():
+    """查看目前暫停用戶清單（需 token）"""
+    token = request.headers.get("X-Admin-Token", "")
+    expected = ADMIN_SETUP_PASSWORD or LINE_CHANNEL_SECRET[:16]
+    if not token or token != expected:
+        return {"error": "unauthorized"}, 401
+    return {
+        "paused_users": list(paused_users),
+        "active_users": len(conversation_history),
+        "admin_ids": list(_admin_ids),
     }, 200
 
 
