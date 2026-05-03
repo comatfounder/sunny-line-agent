@@ -320,6 +320,123 @@ def line_push(user_id: str, text: str) -> None:
         log.info("Push sent to %s: %s", user_id, text[:60])
 
 
+# ── 預約模組 ──────────────────────────────────────────────────────────────────
+
+BOOKING_KEYWORDS = ["預約", "時段", "什麼時候", "哪天", "幾號", "哪個時間",
+                    "訂", "排", "檔期", "何時", "available", "book"]
+
+SHEET_SLOTS   = "可預約時段"
+SHEET_BOOKING = "預約記錄"
+
+
+def get_available_slots() -> list[dict]:
+    """讀取 Sheets 可預約時段分頁，回傳可用時段清單"""
+    sheet = get_sheet(SHEET_SLOTS)
+    if sheet is None:
+        return []
+    try:
+        rows = sheet.get_all_values()
+        available = []
+        for row in rows[1:]:
+            if len(row) >= 3 and row[2].strip() == "可預約":
+                available.append({"date": row[0].strip(), "slot": row[1].strip()})
+        return available
+    except Exception as e:
+        log.error("讀取可預約時段失敗: %s", e)
+        return []
+
+
+def book_slot(user_id: str, date: str, slot: str,
+              name: str, contact: str) -> tuple[bool, str]:
+    """
+    原子性預約操作（workers=1 保證無 race condition）：
+    1. 再次確認時段仍為「可預約」
+    2. 將該行改為「已滿」
+    3. 寫入預約記錄
+    回傳 (success, message)
+    """
+    ws_slots   = get_sheet(SHEET_SLOTS)
+    ws_records = get_sheet(SHEET_BOOKING)
+    if ws_slots is None or ws_records is None:
+        return False, "系統暫時無法完成預約，請稍後再試"
+    try:
+        rows = ws_slots.get_all_values()
+        target_row = None
+        for i, row in enumerate(rows[1:], start=2):
+            if len(row) >= 3 and row[0].strip() == date and row[1].strip() == slot:
+                target_row = i
+                if row[2].strip() != "可預約":
+                    return False, f"很抱歉，{date} {slot} 這個時段剛被預約走了，請選擇其他時段。"
+                break
+        if target_row is None:
+            return False, "找不到這個時段，請確認日期和時間是否正確。"
+
+        # 標記為已滿
+        ws_slots.update_cell(target_row, 3, "已滿")
+
+        # 寫入預約記錄
+        ws_records.append_row([
+            datetime.now().isoformat(),
+            user_id,
+            name,
+            contact,
+            f"{date} {slot}",
+            "已確認",
+        ])
+
+        log.info("預約成功：%s %s → %s (%s)", date, slot, name, contact)
+        return True, f"已為 {name} 預約 {date} {slot} 的拍攝時段"
+    except Exception as e:
+        log.error("預約操作失敗: %s", e)
+        return False, "預約時發生錯誤，請稍後再試。"
+
+
+def is_booking_related(text: str) -> bool:
+    return any(kw in text for kw in BOOKING_KEYWORDS)
+
+
+def get_dynamic_system_prompt(user_message: str) -> str:
+    """根據訊息內容動態組合 SYSTEM_PROMPT，預約相關訊息注入即時時段"""
+    base = get_system_prompt()
+    if not is_booking_related(user_message):
+        return base
+
+    slots = get_available_slots()
+    if slots:
+        slots_text = "\n".join(f"- {s['date']} {s['slot']}" for s in slots)
+        booking_ctx = f"""
+
+# 目前可預約時段（即時資料，請以此為準）
+
+{slots_text}
+
+# 預約確認流程
+
+引導客人完成以下三步驟後才執行預約：
+步驟一：確認拍攝類型（親子、個人、全家福、情侶）
+步驟二：客人從上方時段中選擇一個
+步驟三：請客人提供姓名和聯絡方式（電話或 LINE ID）
+
+三項資訊齊全後，在回覆末尾加入預約標記（客人看不到此標記）：
+BOOK:date:[日期]:slot:[時段]:name:[姓名]:contact:[聯絡方式]
+
+範例：BOOK:date:2026-05-10:slot:10:00-12:00:name:王小明:contact:0912345678
+
+注意：
+- 若客人未選定時段，先列出可用時段讓他選
+- 確認資訊後才輸出 BOOK 標記，不要提前觸發
+- 輸出 BOOK 標記時，同時用文字告知客人預約已完成並說明細節"""
+        return base + booking_ctx
+    else:
+        no_slot_ctx = """
+
+# 目前可預約時段
+
+目前所有時段均已預約。
+請告知客人目前無可用時段，並詢問是否要留下姓名和聯絡方式，有空檔時主動通知。"""
+        return base + no_slot_ctx
+
+
 # ── Claude API ────────────────────────────────────────────────────────────────
 
 def call_claude(user_id: str, user_message: str) -> tuple[str, str]:
@@ -338,7 +455,7 @@ def call_claude(user_id: str, user_message: str) -> tuple[str, str]:
         response = claude_client.messages.create(
             model=CLAUDE_MODEL,
             max_tokens=1024,
-            system=get_system_prompt(),
+            system=get_dynamic_system_prompt(user_message),   # 動態注入時段
             messages=history,
         )
         reply_text = response.content[0].text
@@ -347,11 +464,34 @@ def call_claude(user_id: str, user_message: str) -> tuple[str, str]:
         reply_text = "目前系統有點忙，請稍後再試。"
         status = "ERROR"
 
-    # 偵測 ESCALATE 標記（格式：ESCALATE:user_id:Uxxxxxx）
+    # ── 偵測 BOOK 標記（預約）────────────────────────────────────────────────
+    book_match = re.search(
+        r"BOOK:date:([^:]+):slot:([^:\n]+):name:([^:]+):contact:([^\s\n]+)",
+        reply_text,
+    )
+    if book_match:
+        b_date, b_slot, b_name, b_contact = [g.strip() for g in book_match.groups()]
+        # 移除標記，用戶看不到
+        reply_text = re.sub(r"\s*BOOK:date:[^\n]+", "", reply_text).strip()
+        # 執行預約
+        success, booking_msg = book_slot(user_id, b_date, b_slot, b_name, b_contact)
+        if success:
+            status = "BOOKED"
+            # Push 通知業主
+            if FOUNDER_LINE_USER_ID:
+                line_push(FOUNDER_LINE_USER_ID,
+                    f"新預約\n日期：{b_date} {b_slot}\n姓名：{b_name}\n聯絡：{b_contact}")
+            log.info("BOOKED: %s %s → %s", b_date, b_slot, b_name)
+        else:
+            # 預約失敗（時段已被搶訂），覆蓋 AI 回覆
+            status = "BOOK_FAIL"
+            reply_text = booking_msg
+            log.warning("BOOK_FAIL: %s %s", b_date, b_slot)
+
+    # ── 偵測 ESCALATE 標記 ────────────────────────────────────────────────────
     escalate_match = re.search(r"ESCALATE:user_id:(U\w+)", reply_text)
     if escalate_match:
         status = "ESCALATE"
-        # 移除標記，用戶看不到
         reply_text = re.sub(r"\s*ESCALATE:user_id:U\w+", "", reply_text).strip()
 
     history.append({"role": "assistant", "content": reply_text})
