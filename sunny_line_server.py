@@ -328,16 +328,37 @@ def log_conversation(
         log.error("Sheets 對話記錄寫入失敗: %s", e)
 
 
+def classify_escalate(trigger_text: str) -> str:
+    """
+    根據觸發訊息快速分類 ESCALATE 原因（不呼叫 Claude，純關鍵字比對）。
+    回傳分類字串，用於 Sheets 備註欄。
+    """
+    t = trigger_text.lower()
+    if any(k in t for k in ["費用", "價格", "多少錢", "報價", "便宜", "折扣", "優惠"]):
+        return "費用詢問"
+    if any(k in t for k in ["客訴", "不滿", "差", "失望", "退款", "賠", "抱怨", "爛"]):
+        return "客訴／不滿"
+    if any(k in t for k in ["取消", "改期", "延期", "遲到", "沒來"]):
+        return "預約異動"
+    if any(k in t for k in ["真人", "人工", "老闆", "館主", "負責人"]):
+        return "要求真人"
+    if any(k in t for k in ["商業", "活動", "大型", "合作", "企業"]):
+        return "商業／複雜需求"
+    return "其他"
+
+
 def log_escalate(user_id: str, trigger_text: str) -> None:
-    """將 ESCALATE 事件寫入例外記錄分頁"""
+    """將 ESCALATE 事件寫入例外記錄分頁（含觸發分類）"""
     sheet = get_sheet(SHEET_ESCALATE)
     if sheet is None:
         return
     try:
+        category = classify_escalate(trigger_text)
         sheet.append_row([
             datetime.now().isoformat(),
             user_id,
             trigger_text,
+            category,
             "未處理",
             "",
         ])
@@ -448,7 +469,8 @@ def _time_to_minutes(t: str) -> int:
 
 
 def book_slot(user_id: str, date_str: str, start_t: str, end_t: str,
-              name: str, contact: str) -> tuple[bool, str]:
+              name: str, contact: str,
+              shoot_type: str = "", people: str = "", notes: str = "") -> tuple[bool, str]:
     """
     原子性預約操作（workers=1 保證無 race condition）：
     支援單一時段（09:00-10:00）與跨時段範圍（09:00-12:00）。
@@ -458,7 +480,7 @@ def book_slot(user_id: str, date_str: str, start_t: str, end_t: str,
     2. 找出 date_str 當天所有落在 [start_t, end_t) 範圍內的時段列
     3. 確認全部都是「可預約」
     4. 批次將這些列的 D 欄改為「已滿」
-    5. 寫入預約記錄（一筆，記錄完整時間範圍）
+    5. 寫入預約記錄（一筆，含拍攝類型、人數、備註）
     回傳 (success, message)
     """
     # 驗證日期
@@ -503,19 +525,24 @@ def book_slot(user_id: str, date_str: str, start_t: str, end_t: str,
         for row_idx, _, _, _ in matched_rows:
             ws_slots.update_cell(row_idx, 4, "已滿")
 
-        # 寫入預約記錄（一筆，完整時間範圍）
+        # 寫入預約記錄（完整資訊）
+        hours = (end_min - start_min) // 60
         ws_records.append_row([
             datetime.now().isoformat(),
             user_id,
             name,
             contact,
             f"{date_str} {start_t}-{end_t}",
+            shoot_type or "未指定",
+            people or "未填",
+            f"{hours} 小時",
+            notes or "",
             "已確認",
         ])
 
         slots_count = len(matched_rows)
-        log.info("預約成功：%s %s-%s（%d 時段）→ %s (%s)",
-                 date_str, start_t, end_t, slots_count, name, contact)
+        log.info("預約成功：%s %s-%s（%d 時段）→ %s (%s) [%s / %s]",
+                 date_str, start_t, end_t, slots_count, name, contact, shoot_type, people)
         return True, f"已為 {name} 預約 {date_str} {start_t}-{end_t} 的拍攝時段"
     except Exception as e:
         log.error("預約操作失敗: %s", e)
@@ -573,17 +600,20 @@ def get_dynamic_system_prompt(user_id: str, user_message: str) -> str:
 步驟三：請客人提供姓名和聯絡方式（電話或 LINE ID）
 
 三項資訊齊全後，在回覆末尾加入預約標記（客人看不到此標記）：
-BOOK:date:[YYYY-MM-DD]:start:[HH:MM]:end:[HH:MM]:name:[姓名]:contact:[聯絡方式]
+BOOK:date:[YYYY-MM-DD]:start:[HH:MM]:end:[HH:MM]:name:[姓名]:contact:[聯絡方式]:type:[拍攝類型]:people:[人數描述]:notes:[其他備註]
 
-範例（單一時段）：BOOK:date:2026-05-10:start:09:00:end:10:00:name:王小明:contact:0912345678
-範例（連續時段）：BOOK:date:2026-05-10:start:09:00:end:12:00:name:王小明:contact:0912345678
+範例（親子寫真）：BOOK:date:2026-05-10:start:09:00:end:12:00:name:王小明:contact:0912345678:type:親子寫真:people:2大人3小孩:notes:希望在公園拍
+範例（個人寫真）：BOOK:date:2026-05-10:start:14:00:end:15:00:name:李小花:contact:0987654321:type:個人寫真:people:1人:notes:
 
 注意：
 - 嚴格使用 YYYY-MM-DD 格式填寫日期，HH:MM 格式填寫時間
-- start 和 end 必須完全落在上方可預約清單的邊界上（例如 09:00 開始、12:00 結束）
+- start 和 end 必須完全落在上方可預約清單的邊界上
 - 不可選超出清單範圍的時間（例如 08:00 或 19:00）
-- 確認三項資訊齊全後才輸出 BOOK 標記，不可提前輸出
-- 輸出 BOOK 標記時，同時用文字告知客人預約細節"""
+- type 填對話中提到的拍攝類型（親子寫真／個人寫真／全家福／情侶寫真）
+- people 填人數描述（例：2大人5小孩、1人、2人）
+- notes 填對話中其他有用資訊（特殊需求、備註等），無則留空
+- 確認姓名、聯絡方式、時段三項齊全後才輸出 BOOK 標記，不可提前輸出
+- 輸出 BOOK 標記時，同時用文字向客人確認完整預約細節"""
         return base + booking_ctx
     else:
         return base + """
@@ -621,24 +651,40 @@ def call_claude(user_id: str, user_message: str) -> tuple[str, str]:
         reply_text = "目前系統有點忙，請稍後再試。"
         status = "ERROR"
 
-    # ── 偵測 BOOK 標記（新格式：date/start/end 分開）────────────────────────
+    # ── 偵測 BOOK 標記 ────────────────────────────────────────────────────────
     book_match = re.search(
         r"BOOK:date:(\d{4}-\d{2}-\d{2}):start:(\d{2}:\d{2}):end:(\d{2}:\d{2})"
-        r":name:([^:]+):contact:([^\s\n]+)",
+        r":name:([^:]+):contact:([^:\s\n]+)"
+        r"(?::type:([^:]*?))?(?::people:([^:]*?))?(?::notes:([^\n]*))?(?:\s|$)",
         reply_text,
     )
     if book_match:
-        b_date, b_start, b_end, b_name, b_contact = [g.strip() for g in book_match.groups()]
+        g = [x.strip() if x else "" for x in book_match.groups()]
+        b_date, b_start, b_end, b_name, b_contact = g[0], g[1], g[2], g[3], g[4]
+        b_type, b_people, b_notes = g[5], g[6], g[7]
         # 移除標記，用戶看不到
         reply_text = re.sub(r"\s*BOOK:date:[^\n]+", "", reply_text).strip()
         # 執行預約
-        success, booking_msg = book_slot(user_id, b_date, b_start, b_end, b_name, b_contact)
+        success, booking_msg = book_slot(
+            user_id, b_date, b_start, b_end, b_name, b_contact,
+            shoot_type=b_type, people=b_people, notes=b_notes,
+        )
         if success:
             status = "BOOKED"
-            if FOUNDER_LINE_USER_ID:
-                line_push(FOUNDER_LINE_USER_ID,
-                    f"新預約\n日期：{b_date} {b_start}-{b_end}\n姓名：{b_name}\n聯絡：{b_contact}")
-            log.info("BOOKED: %s %s-%s → %s", b_date, b_start, b_end, b_name)
+            for admin_id in _admin_ids:
+                notify_lines = [
+                    f"📸 新預約通知",
+                    f"姓名：{b_name}",
+                    f"聯絡：{b_contact}",
+                    f"日期：{b_date} {b_start}-{b_end}",
+                    f"類型：{b_type or '未指定'}",
+                    f"人數：{b_people or '未填'}",
+                ]
+                if b_notes:
+                    notify_lines.append(f"備註：{b_notes}")
+                notify_lines.append(f"用戶ID：{user_id}")
+                line_push(admin_id, "\n".join(notify_lines))
+            log.info("BOOKED: %s %s-%s → %s [%s/%s]", b_date, b_start, b_end, b_name, b_type, b_people)
         else:
             status = "BOOK_FAIL"
             reply_text = booking_msg
@@ -935,23 +981,26 @@ def handle_escalate(escalate_user_id: str, trigger_text: str) -> None:
     """
     ESCALATE 升級流程：
     1. 暫停該用戶的 AI 回應
-    2. 寫入 Sheets 例外記錄
-    3. Push 通知業主
+    2. 寫入 Sheets 例外記錄（含觸發分類）
+    3. Push 通知所有管理員
     """
     paused_users.add(escalate_user_id)
+    category = classify_escalate(trigger_text)
     log_escalate(escalate_user_id, trigger_text)
 
-    if FOUNDER_LINE_USER_ID:
-        notify = (
-            f"有一位用戶需要人工介入\n"
-            f"用戶ID：{escalate_user_id}\n"
-            f"觸發訊息：{trigger_text[:100]}\n\n"
-            f"該用戶 AI 回應已暫停，可用指令：\n"
-            f"reply {escalate_user_id} [你的回覆]\n"
-            f"resume {escalate_user_id}"
-        )
-        line_push(FOUNDER_LINE_USER_ID, notify)
-    log.info("ESCALATE: user %s → paused + notified founder", escalate_user_id)
+    notify = (
+        f"⚠️ 需要人工介入\n"
+        f"分類：{category}\n"
+        f"觸發訊息：{trigger_text[:80]}\n"
+        f"用戶ID：{escalate_user_id}\n\n"
+        f"AI 回應已暫停，可用指令：\n"
+        f"reply {escalate_user_id} [你的回覆]\n"
+        f"resume {escalate_user_id}"
+    )
+    for admin_id in _admin_ids:
+        line_push(admin_id, notify)
+    log.info("ESCALATE: user %s [%s] → paused + notified %d admin(s)",
+             escalate_user_id, category, len(_admin_ids))
 
 
 # ── Webhook 路由 ──────────────────────────────────────────────────────────────
