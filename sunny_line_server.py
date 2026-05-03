@@ -729,8 +729,13 @@ def is_booking_context(user_id: str, user_message: str) -> bool:
 
 
 def get_dynamic_system_prompt(user_id: str, user_message: str) -> str:
-    """根據訊息內容動態組合 SYSTEM_PROMPT，預約相關訊息注入即時時段"""
+    """根據訊息內容動態組合 SYSTEM_PROMPT，注入 user_id 與預約時段"""
     base = get_system_prompt()
+
+    # 永遠注入當前用戶的 LINE user_id，確保 AI 能正確生成 ESCALATE tag
+    user_ctx = f"\n\n# 當前用戶資訊\n當前對話的用戶 LINE ID：{user_id}\n（ESCALATE tag 請直接使用此 ID）"
+    base = base + user_ctx
+
     if not is_booking_context(user_id, user_message):
         return base
 
@@ -927,10 +932,13 @@ def call_claude(user_id: str, user_message: str) -> tuple[str, str]:
                         f"{c_new_date} {c_new_start}-{c_new_end}")
 
     # ── 偵測 ESCALATE 標記 ────────────────────────────────────────────────────
-    escalate_match = re.search(r"ESCALATE:user_id:(U\w+)", reply_text)
+    # 主要格式：ESCALATE:user_id:Uxxxxxx（AI 從注入的 user_id 填入）
+    # 降級格式：任何含 ESCALATE:user_id: 的輸出（AI 格式錯誤時也能捕捉）
+    escalate_match = re.search(r"ESCALATE:user_id:(\S+)", reply_text)
     if escalate_match:
         status = "ESCALATE"
-        reply_text = re.sub(r"\s*ESCALATE:user_id:U\w+", "", reply_text).strip()
+        # 不論 AI 填了什麼 user_id，一律用 webhook 傳入的真實 user_id
+        reply_text = re.sub(r"\s*ESCALATE:user_id:\S+", "", reply_text).strip()
 
     history.append({"role": "assistant", "content": reply_text})
     log_conversation(user_id, user_message, reply_text, status)
