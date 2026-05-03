@@ -330,31 +330,64 @@ SHEET_BOOKING = "預約記錄"
 
 
 def get_available_slots() -> list[dict]:
-    """讀取 Sheets 可預約時段分頁，回傳可用時段清單"""
+    """
+    讀取 Sheets 可預約時段（格式：日期|開始時間|結束時間|狀態）
+    自動過濾今天以前的時段，只回傳未來的「可預約」時段
+    """
     sheet = get_sheet(SHEET_SLOTS)
     if sheet is None:
         return []
     try:
         rows = sheet.get_all_values()
+        today = datetime.now().date()
         available = []
-        for row in rows[1:]:
-            if len(row) >= 3 and row[2].strip() == "可預約":
-                available.append({"date": row[0].strip(), "slot": row[1].strip()})
+        for i, row in enumerate(rows[1:], start=2):
+            if len(row) < 4:
+                continue
+            raw_date, start_t, end_t, status = (
+                row[0].strip(), row[1].strip(), row[2].strip(), row[3].strip()
+            )
+            if status != "可預約":
+                continue
+            # 過濾過去日期
+            try:
+                slot_date = datetime.strptime(raw_date, "%Y-%m-%d").date()
+            except ValueError:
+                log.warning("Sheets 日期格式錯誤（row %d）: %r", i, raw_date)
+                continue
+            if slot_date < today:
+                continue
+            available.append({
+                "row": i,
+                "date": raw_date,
+                "start": start_t,
+                "end": end_t,
+                "label": f"{raw_date} {start_t}-{end_t}",
+            })
         return available
     except Exception as e:
         log.error("讀取可預約時段失敗: %s", e)
         return []
 
 
-def book_slot(user_id: str, date: str, slot: str,
+def book_slot(user_id: str, date_str: str, start_t: str, end_t: str,
               name: str, contact: str) -> tuple[bool, str]:
     """
     原子性預約操作（workers=1 保證無 race condition）：
-    1. 再次確認時段仍為「可預約」
-    2. 將該行改為「已滿」
-    3. 寫入預約記錄
+    1. 驗證日期不是過去
+    2. 找到對應 row，再次確認仍為「可預約」
+    3. 將 D 欄改為「已滿」
+    4. 寫入預約記錄
     回傳 (success, message)
     """
+    # 驗證日期
+    try:
+        slot_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+        if slot_date < datetime.now().date():
+            return False, "這個日期已經過去，請選擇未來的時段。"
+    except ValueError:
+        return False, "日期格式有誤，請重新選擇。"
+
     ws_slots   = get_sheet(SHEET_SLOTS)
     ws_records = get_sheet(SHEET_BOOKING)
     if ws_slots is None or ws_records is None:
@@ -363,16 +396,20 @@ def book_slot(user_id: str, date: str, slot: str,
         rows = ws_slots.get_all_values()
         target_row = None
         for i, row in enumerate(rows[1:], start=2):
-            if len(row) >= 3 and row[0].strip() == date and row[1].strip() == slot:
+            if len(row) < 4:
+                continue
+            if (row[0].strip() == date_str and
+                    row[1].strip() == start_t and
+                    row[2].strip() == end_t):
                 target_row = i
-                if row[2].strip() != "可預約":
-                    return False, f"很抱歉，{date} {slot} 這個時段剛被預約走了，請選擇其他時段。"
+                if row[3].strip() != "可預約":
+                    return False, f"很抱歉，{date_str} {start_t}-{end_t} 這個時段剛被預約走了，請選擇其他時段。"
                 break
         if target_row is None:
             return False, "找不到這個時段，請確認日期和時間是否正確。"
 
-        # 標記為已滿
-        ws_slots.update_cell(target_row, 3, "已滿")
+        # 標記為已滿（第 4 欄）
+        ws_slots.update_cell(target_row, 4, "已滿")
 
         # 寫入預約記錄
         ws_records.append_row([
@@ -380,12 +417,12 @@ def book_slot(user_id: str, date: str, slot: str,
             user_id,
             name,
             contact,
-            f"{date} {slot}",
+            f"{date_str} {start_t}-{end_t}",
             "已確認",
         ])
 
-        log.info("預約成功：%s %s → %s (%s)", date, slot, name, contact)
-        return True, f"已為 {name} 預約 {date} {slot} 的拍攝時段"
+        log.info("預約成功：%s %s-%s → %s (%s)", date_str, start_t, end_t, name, contact)
+        return True, f"已為 {name} 預約 {date_str} {start_t}-{end_t} 的拍攝時段"
     except Exception as e:
         log.error("預約操作失敗: %s", e)
         return False, "預約時發生錯誤，請稍後再試。"
@@ -403,12 +440,17 @@ def get_dynamic_system_prompt(user_message: str) -> str:
 
     slots = get_available_slots()
     if slots:
-        slots_text = "\n".join(f"- {s['date']} {s['slot']}" for s in slots)
+        # 只列出最近 30 筆避免 prompt 太長
+        display = slots[:30]
+        slots_text = "\n".join(
+            f"- {s['label']}" for s in display
+        )
+        more = f"\n（還有 {len(slots)-30} 個時段，客人可指定日期查詢）" if len(slots) > 30 else ""
         booking_ctx = f"""
 
 # 目前可預約時段（即時資料，請以此為準）
 
-{slots_text}
+{slots_text}{more}
 
 # 預約確認流程
 
@@ -418,23 +460,23 @@ def get_dynamic_system_prompt(user_message: str) -> str:
 步驟三：請客人提供姓名和聯絡方式（電話或 LINE ID）
 
 三項資訊齊全後，在回覆末尾加入預約標記（客人看不到此標記）：
-BOOK:date:[日期]:slot:[時段]:name:[姓名]:contact:[聯絡方式]
+BOOK:date:[YYYY-MM-DD]:start:[HH:MM]:end:[HH:MM]:name:[姓名]:contact:[聯絡方式]
 
-範例：BOOK:date:2026-05-10:slot:10:00-12:00:name:王小明:contact:0912345678
+範例：BOOK:date:2026-05-10:start:09:00:end:11:00:name:王小明:contact:0912345678
 
 注意：
-- 若客人未選定時段，先列出可用時段讓他選
-- 確認資訊後才輸出 BOOK 標記，不要提前觸發
+- 嚴格使用 YYYY-MM-DD 格式填寫日期，HH:MM 格式填寫時間
+- 時段必須從上方清單中選取，不可自行創造時段
+- 確認三項資訊齊全後才輸出 BOOK 標記
 - 輸出 BOOK 標記時，同時用文字告知客人預約已完成並說明細節"""
         return base + booking_ctx
     else:
-        no_slot_ctx = """
+        return base + """
 
 # 目前可預約時段
 
 目前所有時段均已預約。
 請告知客人目前無可用時段，並詢問是否要留下姓名和聯絡方式，有空檔時主動通知。"""
-        return base + no_slot_ctx
 
 
 # ── Claude API ────────────────────────────────────────────────────────────────
@@ -464,29 +506,28 @@ def call_claude(user_id: str, user_message: str) -> tuple[str, str]:
         reply_text = "目前系統有點忙，請稍後再試。"
         status = "ERROR"
 
-    # ── 偵測 BOOK 標記（預約）────────────────────────────────────────────────
+    # ── 偵測 BOOK 標記（新格式：date/start/end 分開）────────────────────────
     book_match = re.search(
-        r"BOOK:date:([^:]+):slot:([^:\n]+):name:([^:]+):contact:([^\s\n]+)",
+        r"BOOK:date:(\d{4}-\d{2}-\d{2}):start:(\d{2}:\d{2}):end:(\d{2}:\d{2})"
+        r":name:([^:]+):contact:([^\s\n]+)",
         reply_text,
     )
     if book_match:
-        b_date, b_slot, b_name, b_contact = [g.strip() for g in book_match.groups()]
+        b_date, b_start, b_end, b_name, b_contact = [g.strip() for g in book_match.groups()]
         # 移除標記，用戶看不到
         reply_text = re.sub(r"\s*BOOK:date:[^\n]+", "", reply_text).strip()
         # 執行預約
-        success, booking_msg = book_slot(user_id, b_date, b_slot, b_name, b_contact)
+        success, booking_msg = book_slot(user_id, b_date, b_start, b_end, b_name, b_contact)
         if success:
             status = "BOOKED"
-            # Push 通知業主
             if FOUNDER_LINE_USER_ID:
                 line_push(FOUNDER_LINE_USER_ID,
-                    f"新預約\n日期：{b_date} {b_slot}\n姓名：{b_name}\n聯絡：{b_contact}")
-            log.info("BOOKED: %s %s → %s", b_date, b_slot, b_name)
+                    f"新預約\n日期：{b_date} {b_start}-{b_end}\n姓名：{b_name}\n聯絡：{b_contact}")
+            log.info("BOOKED: %s %s-%s → %s", b_date, b_start, b_end, b_name)
         else:
-            # 預約失敗（時段已被搶訂），覆蓋 AI 回覆
             status = "BOOK_FAIL"
             reply_text = booking_msg
-            log.warning("BOOK_FAIL: %s %s", b_date, b_slot)
+            log.warning("BOOK_FAIL: %s %s-%s", b_date, b_start, b_end)
 
     # ── 偵測 ESCALATE 標記 ────────────────────────────────────────────────────
     escalate_match = re.search(r"ESCALATE:user_id:(U\w+)", reply_text)
