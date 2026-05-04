@@ -92,9 +92,13 @@ FOUNDER_LINE_USER_ID      = os.environ.get("FOUNDER_LINE_USER_ID", "")
 ADMIN_SETUP_PASSWORD      = os.environ.get("ADMIN_SETUP_PASSWORD", "")
 REDIS_URL                 = os.environ.get("REDIS_URL", "")
 
-LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
-LINE_PUSH_URL  = "https://api.line.me/v2/bot/message/push"
-CLAUDE_MODEL   = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-5")
+LINE_REPLY_URL    = "https://api.line.me/v2/bot/message/reply"
+LINE_PUSH_URL     = "https://api.line.me/v2/bot/message/push"
+LINE_RICHMENU_URL = "https://api.line.me/v2/bot/user/{user_id}/richmenu/{rich_menu_id}"
+CLAUDE_MODEL      = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-5")
+
+# Admin 專用 Rich Menu ID（由 setup_admin_rich_menu.py 建立後填入）
+ADMIN_RICH_MENU_ID = os.environ.get("ADMIN_RICH_MENU_ID", "richmenu-b92c58e0f814f75fc4feb6b40d88a279")
 
 # Sheets 分頁名稱（依客戶 Sheets 設定調整）
 SHEET_LOG       = "對話記錄"
@@ -330,6 +334,7 @@ def is_admin(user_id: str) -> bool:
 def add_admin(user_id: str) -> bool:
     """
     將 user_id 加入管理員清單，並同步寫入 Sheets 設定分頁（ADMIN_USER_IDS）。
+    同時套用 Admin Rich Menu（對話框底部指令按鈕）。
     回傳是否成功寫入 Sheets。
     """
     global _admin_ids
@@ -341,7 +346,11 @@ def add_admin(user_id: str) -> bool:
         if uid.strip().startswith("U")
     )
     extra = _admin_ids - base
-    return write_setting("ADMIN_USER_IDS", ",".join(sorted(extra)))
+    ok = write_setting("ADMIN_USER_IDS", ",".join(sorted(extra)))
+    # 套用 Admin Rich Menu（非同步，失敗不影響主流程）
+    if ADMIN_RICH_MENU_ID:
+        link_rich_menu(user_id, ADMIN_RICH_MENU_ID)
+    return ok
 
 
 def remove_admin(user_id: str) -> bool:
@@ -359,7 +368,10 @@ def remove_admin(user_id: str) -> bool:
         return False  # 環境變數設定的 admin 不允許透過指令移除
     _admin_ids.discard(user_id)
     extra = _admin_ids - base
-    return write_setting("ADMIN_USER_IDS", ",".join(sorted(extra)))
+    ok = write_setting("ADMIN_USER_IDS", ",".join(sorted(extra)))
+    # 解除 Admin Rich Menu（恢復一般用戶介面）
+    unlink_rich_menu(user_id)
+    return ok
 
 
 def write_setting(key: str, value: str) -> bool:
@@ -540,6 +552,38 @@ def line_push(user_id: str, text: str) -> None:
         log.error("LINE Push API error %s: %s", resp.status_code, resp.text)
     else:
         log.info("Push sent to %s: %s", user_id, text[:60])
+
+
+def link_rich_menu(user_id: str, rich_menu_id: str) -> None:
+    """將指定 Rich Menu 連結到用戶（讓對話框底部出現按鈕）"""
+    if not user_id or not rich_menu_id or not LINE_CHANNEL_ACCESS_TOKEN:
+        return
+    url = LINE_RICHMENU_URL.format(user_id=user_id, rich_menu_id=rich_menu_id)
+    resp = requests.post(
+        url,
+        headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"},
+        timeout=10,
+    )
+    if resp.ok:
+        log.info("Rich Menu linked: %s → %s", user_id, rich_menu_id)
+    else:
+        log.warning("Rich Menu link failed: %s %s", resp.status_code, resp.text)
+
+
+def unlink_rich_menu(user_id: str) -> None:
+    """解除用戶的 Rich Menu 連結（移除管理員時恢復預設）"""
+    if not user_id or not LINE_CHANNEL_ACCESS_TOKEN:
+        return
+    url = f"https://api.line.me/v2/bot/user/{user_id}/richmenu"
+    resp = requests.delete(
+        url,
+        headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"},
+        timeout=10,
+    )
+    if resp.ok:
+        log.info("Rich Menu unlinked: %s", user_id)
+    else:
+        log.warning("Rich Menu unlink failed: %s %s", resp.status_code, resp.text)
 
 
 # ── 預約模組 ──────────────────────────────────────────────────────────────────
@@ -1346,10 +1390,24 @@ def handle_admin(user_id: str, text: str) -> str:
         return f"已恢復 {target} 的 AI 自動回應。"
 
     # ── reply [user_id] [訊息]（relay mode）─────────────────────────────────
+    # 注意：Rich Menu 的「代傳訊息」按鈕會傳 "reply "（末尾有空格），
+    # 此時 parts 為空，回傳格式提示讓管理員補上 user_id 和訊息
     if text_lower.startswith("reply "):
         parts = original[6:].split(" ", 1)
         if len(parts) < 2:
-            return "格式：reply [user_id] [要傳給用戶的訊息]"
+            # 取得最近有待處理的 ESCALATE user_id 作為提示
+            recent_uid = ""
+            try:
+                sheet = get_sheet(SHEET_ESCALATE)
+                if sheet:
+                    rows = sheet.get_all_values()
+                    pending = [r for r in rows[1:] if len(r) >= 5 and r[4] == "未處理" and r[1].startswith("U")]
+                    if pending:
+                        recent_uid = pending[-1][1]
+            except Exception:
+                pass
+            hint = f"\n\n💡 最近待處理：{recent_uid}" if recent_uid else ""
+            return f"💬 代傳訊息格式：\nreply [user_id] [訊息內容]\n\n範例：\nreply U1234567890abcdef 您好，我是負責人{hint}"
         target_id, relay_msg = parts[0].strip(), parts[1].strip()
         if not target_id.startswith("U"):
             return f"user_id 格式錯誤（應為 Uxxxxxx），收到：{target_id}"
