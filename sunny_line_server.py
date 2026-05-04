@@ -1290,6 +1290,8 @@ cancel — 取消提示詞更新
 pause [user_id] — 暫停特定用戶的 AI 回應
 resume [user_id] — 恢復特定用戶的 AI 回應
 reply [user_id] [訊息] — 代傳訊息給用戶
+resolve [user_id] — 將該用戶最近一筆未處理例外標記為已結案
+resolve all — 一次結案所有未處理例外
 
 【管理員】
 listadmin — 查看所有管理員
@@ -1472,6 +1474,40 @@ def handle_admin(user_id: str, text: str) -> str:
             cat = r[3] if len(r) > 3 else ""
             lines.append(f"🕐 {ts}\n分類：{cat}\n訊息：{msg}\n用戶：{uid}\n▶ reply {uid} [你的回覆]")
         return "\n\n".join(lines)
+
+    # ── resolve [user_id | all] — 例外結案 ───────────────────────────────────
+    if text_lower == "resolve all" or text_lower.startswith("resolve "):
+        target_uid = None if text_lower == "resolve all" else original[8:].strip()
+        if target_uid and not target_uid.startswith("U"):
+            return f"user_id 格式錯誤（應為 Uxxxxxx），收到：{target_uid}\n用法：resolve [user_id] 或 resolve all"
+        sheet = get_sheet(SHEET_ESCALATE)
+        if sheet is None:
+            return "⚠️ 無法讀取例外記錄。"
+        try:
+            rows = sheet.get_all_values()
+        except Exception as e:
+            return f"讀取失敗：{e}"
+        ts_now = now_tw().strftime('%Y-%m-%dT%H:%M:%S')
+        updates = []
+        closed = 0
+        for i, row in enumerate(rows[1:], start=2):  # 第 2 行起（跳標題）
+            if len(row) < 5:
+                continue
+            if row[4] != "未處理":
+                continue
+            if target_uid and row[1] != target_uid:
+                continue
+            # 更新 E 欄（業主處理狀態）和 F 欄（處理時間）
+            updates.append({"range": f"E{i}:F{i}", "values": [["已結案", ts_now]]})
+            closed += 1
+        if not updates:
+            return f"找不到{'該用戶的' if target_uid else ''}未處理例外記錄。"
+        try:
+            sheet.batch_update(updates)
+        except Exception as e:
+            return f"更新失敗：{e}"
+        scope = f"{target_uid} 的" if target_uid else "所有"
+        return f"✅ 已結案 {scope} {closed} 筆例外記錄。\n結案時間：{ts_now}"
 
     # ── testnotify — 測試推播給所有管理員 ───────────────────────────────────
     if text_lower == "testnotify":
