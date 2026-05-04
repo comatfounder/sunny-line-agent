@@ -40,7 +40,14 @@ import base64
 import logging
 import pathlib
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
+# 台灣時區（UTC+8）
+TZ_TW = timezone(timedelta(hours=8))
+
+def now_tw() -> datetime:
+    """回傳當前台灣時間（UTC+8），不帶時區標記（避免與 Sheets 舊資料比較時 TypeError）"""
+    return datetime.now(tz=TZ_TW).replace(tzinfo=None)
 
 from flask import Flask, request, abort
 import anthropic
@@ -440,7 +447,7 @@ def log_conversation(
         return
     try:
         sheet.append_row([
-            datetime.now().isoformat(),
+            now_tw().isoformat(),
             user_id,
             user_text,
             reply_text,
@@ -478,7 +485,7 @@ def log_escalate(user_id: str, trigger_text: str) -> None:
     try:
         category = classify_escalate(trigger_text)
         sheet.append_row([
-            datetime.now().isoformat(),
+            now_tw().isoformat(),
             user_id,
             trigger_text,
             category,
@@ -555,7 +562,7 @@ def get_available_slots() -> list[dict]:
         return []
     try:
         rows = sheet.get_all_values()
-        today = datetime.now().date()
+        today = now_tw().date()
         available = []
         for i, row in enumerate(rows[1:], start=2):
             if len(row) < 4:
@@ -610,7 +617,7 @@ def book_slot(user_id: str, date_str: str, start_t: str, end_t: str,
     # 驗證日期
     try:
         slot_date = datetime.strptime(date_str, "%Y-%m-%d").date()
-        if slot_date < datetime.now().date():
+        if slot_date < now_tw().date():
             return False, "這個日期已經過去，請選擇未來的時段。"
     except ValueError:
         return False, "日期格式有誤，請重新選擇。"
@@ -652,7 +659,7 @@ def book_slot(user_id: str, date_str: str, start_t: str, end_t: str,
         # 寫入預約記錄（完整資訊）
         hours = (end_min - start_min) // 60
         ws_records.append_row([
-            datetime.now().isoformat(),
+            now_tw().isoformat(),
             user_id,
             name,
             contact,
@@ -745,7 +752,7 @@ def change_booking(user_id: str,
         # ── Step 1：確認新時段全數可預約 ─────────────────────────────────────
         try:
             new_slot_date = datetime.strptime(new_date, "%Y-%m-%d").date()
-            if new_slot_date < datetime.now().date():
+            if new_slot_date < now_tw().date():
                 return False, "新時段的日期已經過去，請選擇未來的時段。"
         except ValueError:
             return False, "新時段日期格式有誤。"
@@ -811,7 +818,7 @@ def change_booking(user_id: str,
         new_slot_str = f"{new_date} {new_start}-{new_end}"
         hours = (new_end_min - new_start_min) // 60
         ws_records.append_row([
-            datetime.now().isoformat(),
+            now_tw().isoformat(),
             user_id,
             rec_name,
             rec_contact,
@@ -1117,7 +1124,7 @@ def fetch_conversations(days: int) -> list[list]:
     try:
         rows = sheet.get_all_values()
         # 自然日邊界：從 N-1 天前的 00:00:00 起（days=1 → 今天 00:00；days=7 → 6 天前 00:00）
-        today_midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        today_midnight = now_tw().replace(hour=0, minute=0, second=0, microsecond=0)
         cutoff = today_midnight - timedelta(days=days - 1)
         result = []
         for row in rows[1:]:  # 跳過標題列
@@ -1169,9 +1176,9 @@ def analyze_conversations(days: int) -> str:
 
     report = call_claude_analysis(analysis_prompt)
     # 顯示實際資料起始日期
-    today_midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    today_midnight = now_tw().replace(hour=0, minute=0, second=0, microsecond=0)
     data_start = today_midnight - timedelta(days=days - 1)
-    header = f"[{label}報告] {data_start.strftime('%m/%d')}–{datetime.now().strftime('%m/%d %H:%M')}\n對話：{len(rows)} 筆 / 用戶：{unique_users} 人 / ESCALATE：{escalate_count} 件\n\n"
+    header = f"[{label}報告] {data_start.strftime('%m/%d')}–{now_tw().strftime('%m/%d %H:%M')}\n對話：{len(rows)} 筆 / 用戶：{unique_users} 人 / ESCALATE：{escalate_count} 件\n\n"
     return header + report
 
 
@@ -1267,7 +1274,7 @@ def handle_admin(user_id: str, text: str) -> str:
             except Exception:
                 pass
         return (
-            f"系統狀態 {datetime.now().strftime('%m/%d %H:%M')}\n"
+            f"系統狀態 {now_tw().strftime('%m/%d %H:%M')}\n"
             f"活躍用戶：{active} 人\n"
             f"暫停中：{paused} 人\n"
             f"未處理 ESCALATE：{unhandled} 件\n"
@@ -1391,7 +1398,7 @@ def handle_admin(user_id: str, text: str) -> str:
             return "⚠️ 管理員清單為空！請先設定 FOUNDER_LINE_USER_ID 或用 addadmin 新增。"
         test_msg = (
             f"✅ 推播測試成功\n"
-            f"時間：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"時間：{now_tw().strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"管理員數：{len(targets)} 人\n"
             f"NOTIFY/ESCALATE 通知正常運作中。"
         )
@@ -1528,7 +1535,7 @@ def handle_notify(notify_user_id: str, trigger_text: str, reason: str) -> None:
     if sheet:
         try:
             sheet.append_row([
-                datetime.now().isoformat(),
+                now_tw().isoformat(),
                 notify_user_id,
                 trigger_text[:200],
                 "知識空缺",
@@ -1695,7 +1702,7 @@ def health():
             pass
     return {
         "status": "ok",
-        "time": datetime.now().isoformat(),
+        "time": now_tw().isoformat(),
         "redis": "connected" if redis_ok else "in-memory fallback",
         "paused_users": get_paused_count(),
         "system_prompt_length": len(get_system_prompt()),
