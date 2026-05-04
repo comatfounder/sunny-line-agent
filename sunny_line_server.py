@@ -1110,13 +1110,15 @@ def call_claude_analysis(prompt: str) -> str:
 # ── 模組 7-4：對話分析 ────────────────────────────────────────────────────────
 
 def fetch_conversations(days: int) -> list[list]:
-    """從 Sheets 讀取最近 N 天的對話記錄"""
+    """從 Sheets 讀取最近 N 天的對話記錄（以自然日 00:00 為邊界）"""
     sheet = get_sheet(SHEET_LOG)
     if sheet is None:
         return []
     try:
         rows = sheet.get_all_values()
-        cutoff = datetime.now() - timedelta(days=days)
+        # 自然日邊界：從 N-1 天前的 00:00:00 起（days=1 → 今天 00:00；days=7 → 6 天前 00:00）
+        today_midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        cutoff = today_midnight - timedelta(days=days - 1)
         result = []
         for row in rows[1:]:  # 跳過標題列
             if not row or not row[0]:
@@ -1166,20 +1168,25 @@ def analyze_conversations(days: int) -> str:
 格式：純文字，不要 markdown 標題符號，每段前面加數字即可。"""
 
     report = call_claude_analysis(analysis_prompt)
-    header = f"[{label}報告] {datetime.now().strftime('%Y-%m-%d %H:%M')}\n對話：{len(rows)} 筆 / 用戶：{unique_users} 人 / ESCALATE：{escalate_count} 件\n\n"
+    # 顯示實際資料起始日期
+    today_midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    data_start = today_midnight - timedelta(days=days - 1)
+    header = f"[{label}報告] {data_start.strftime('%m/%d')}–{datetime.now().strftime('%m/%d %H:%M')}\n對話：{len(rows)} 筆 / 用戶：{unique_users} 人 / ESCALATE：{escalate_count} 件\n\n"
     return header + report
 
 
 # ── 模組 7-5：每日自動報告（APScheduler） ────────────────────────────────────
 
 def send_daily_report() -> None:
-    """APScheduler 每日定時呼叫，push 昨日報告給業主"""
-    if not FOUNDER_LINE_USER_ID:
-        log.warning("FOUNDER_LINE_USER_ID 未設定，無法發送每日報告")
+    """APScheduler 每日定時呼叫，push 今日報告給所有管理員"""
+    targets = list(_admin_ids) or ([FOUNDER_LINE_USER_ID] if FOUNDER_LINE_USER_ID else [])
+    if not targets:
+        log.warning("沒有設定管理員，無法發送每日報告")
         return
-    log.info("每日報告觸發中...")
+    log.info("每日報告觸發中，推送給 %d 位管理員...", len(targets))
     report = analyze_conversations(days=1)
-    line_push(FOUNDER_LINE_USER_ID, report)
+    for admin_id in targets:
+        line_push(admin_id, report)
 
 
 def init_scheduler() -> None:
@@ -1236,6 +1243,7 @@ reply [user_id] [訊息] — 代傳訊息給用戶
 listadmin — 查看所有管理員
 addadmin [user_id] — 新增管理員
 removeadmin [user_id] — 移除管理員
+testnotify — 測試推播通知（確認所有管理員都能收到）
 help — 顯示此說明"""
 
 
@@ -1375,6 +1383,26 @@ def handle_admin(user_id: str, text: str) -> str:
         if result is False:
             return f"{target} 是透過環境變數設定的管理員，無法透過指令移除。請在 Railway 修改 FOUNDER_LINE_USER_ID。"
         return f"已移除管理員：{target}"
+
+    # ── testnotify — 測試推播給所有管理員 ───────────────────────────────────
+    if text_lower == "testnotify":
+        targets = sorted(_admin_ids)
+        if not targets:
+            return "⚠️ 管理員清單為空！請先設定 FOUNDER_LINE_USER_ID 或用 addadmin 新增。"
+        test_msg = (
+            f"✅ 推播測試成功\n"
+            f"時間：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"管理員數：{len(targets)} 人\n"
+            f"NOTIFY/ESCALATE 通知正常運作中。"
+        )
+        success, fail = 0, 0
+        for tid in targets:
+            try:
+                line_push(tid, test_msg)
+                success += 1
+            except Exception:
+                fail += 1
+        return f"測試推播完成：{success} 成功 / {fail} 失敗\n目標：{', '.join(targets)}"
 
     # ── slots [日期] — 查看某天時段狀態 ─────────────────────────────────────
     if text_lower.startswith("slots"):
