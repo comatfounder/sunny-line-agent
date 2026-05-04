@@ -98,7 +98,7 @@ LINE_RICHMENU_URL = "https://api.line.me/v2/bot/user/{user_id}/richmenu/{rich_me
 CLAUDE_MODEL      = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-5")
 
 # Admin 專用 Rich Menu ID（由 setup_admin_rich_menu.py 建立後填入）
-ADMIN_RICH_MENU_ID = os.environ.get("ADMIN_RICH_MENU_ID", "richmenu-b92c58e0f814f75fc4feb6b40d88a279")
+ADMIN_RICH_MENU_ID = os.environ.get("ADMIN_RICH_MENU_ID", "richmenu-c4138febae9371bc555a580318301a9e")
 
 # Sheets 分頁名稱（依客戶 Sheets 設定調整）
 SHEET_LOG       = "對話記錄"
@@ -1279,6 +1279,7 @@ reload — 重新載入知識庫與設定
 report — 今日對話摘要
 report 週 — 本週報告
 report 月 — 本月報告
+pending — 查看所有未處理的例外記錄（ESCALATE/NOTIFY）
 
 【AI 設定】
 update prompt [內容] — 更新提示詞（有確認流程）
@@ -1450,6 +1451,27 @@ def handle_admin(user_id: str, text: str) -> str:
         if result is False:
             return f"{target} 是透過環境變數設定的管理員，無法透過指令移除。請在 Railway 修改 FOUNDER_LINE_USER_ID。"
         return f"已移除管理員：{target}"
+
+    # ── pending — 顯示最近未處理的例外記錄 ───────────────────────────────────
+    if text_lower == "pending":
+        sheet = get_sheet(SHEET_ESCALATE)
+        if sheet is None:
+            return "⚠️ 無法讀取例外記錄。"
+        try:
+            rows = sheet.get_all_values()
+            pending = [r for r in rows[1:] if len(r) >= 5 and r[4] == "未處理" and r[1].startswith("U")]
+        except Exception as e:
+            return f"讀取失敗：{e}"
+        if not pending:
+            return "✅ 目前沒有待處理的例外記錄。"
+        lines = [f"⚠️ 待處理例外（{len(pending)} 件）\n"]
+        for r in pending[-5:]:  # 最多顯示最近 5 筆
+            ts = r[0][:16] if r[0] else "?"
+            uid = r[1]
+            msg = r[2][:30] if len(r) > 2 else ""
+            cat = r[3] if len(r) > 3 else ""
+            lines.append(f"🕐 {ts}\n分類：{cat}\n訊息：{msg}\n用戶：{uid}\n▶ reply {uid} [你的回覆]")
+        return "\n\n".join(lines)
 
     # ── testnotify — 測試推播給所有管理員 ───────────────────────────────────
     if text_lower == "testnotify":
