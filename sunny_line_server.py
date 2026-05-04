@@ -1390,24 +1390,26 @@ def handle_admin(user_id: str, text: str) -> str:
         return f"已恢復 {target} 的 AI 自動回應。"
 
     # ── reply [user_id] [訊息]（relay mode）─────────────────────────────────
-    # 注意：Rich Menu 的「代傳訊息」按鈕會傳 "reply "（末尾有空格），
-    # 此時 parts 為空，回傳格式提示讓管理員補上 user_id 和訊息
+    # Rich Menu 按鈕傳 "reply "（LINE 會截掉空格變成 "reply"）→ 兩種都攔截
+    if text_lower.strip() == "reply":
+        # 純 "reply" 或 "reply " → 顯示格式提示 + 最近待處理 user_id
+        recent_uid = ""
+        try:
+            sheet = get_sheet(SHEET_ESCALATE)
+            if sheet:
+                rows = sheet.get_all_values()
+                pending = [r for r in rows[1:] if len(r) >= 5 and r[4] == "未處理" and r[1].startswith("U")]
+                if pending:
+                    recent_uid = pending[-1][1]
+        except Exception:
+            pass
+        hint = f"\n\n💡 最近待處理：{recent_uid}" if recent_uid else ""
+        return f"💬 代傳訊息格式：\nreply [user_id] [訊息內容]\n\n範例：\nreply U1234567890abcdef 您好，我是負責人{hint}"
+
     if text_lower.startswith("reply "):
         parts = original[6:].split(" ", 1)
         if len(parts) < 2:
-            # 取得最近有待處理的 ESCALATE user_id 作為提示
-            recent_uid = ""
-            try:
-                sheet = get_sheet(SHEET_ESCALATE)
-                if sheet:
-                    rows = sheet.get_all_values()
-                    pending = [r for r in rows[1:] if len(r) >= 5 and r[4] == "未處理" and r[1].startswith("U")]
-                    if pending:
-                        recent_uid = pending[-1][1]
-            except Exception:
-                pass
-            hint = f"\n\n💡 最近待處理：{recent_uid}" if recent_uid else ""
-            return f"💬 代傳訊息格式：\nreply [user_id] [訊息內容]\n\n範例：\nreply U1234567890abcdef 您好，我是負責人{hint}"
+            return "格式：reply [user_id] [要傳給用戶的訊息]"
         target_id, relay_msg = parts[0].strip(), parts[1].strip()
         if not target_id.startswith("U"):
             return f"user_id 格式錯誤（應為 Uxxxxxx），收到：{target_id}"
