@@ -447,7 +447,7 @@ def log_conversation(
         return
     try:
         sheet.append_row([
-            now_tw().isoformat(),
+            now_tw().strftime('%Y-%m-%dT%H:%M:%S'),
             user_id,
             user_text,
             reply_text,
@@ -485,7 +485,7 @@ def log_escalate(user_id: str, trigger_text: str) -> None:
     try:
         category = classify_escalate(trigger_text)
         sheet.append_row([
-            now_tw().isoformat(),
+            now_tw().strftime('%Y-%m-%dT%H:%M:%S'),
             user_id,
             trigger_text,
             category,
@@ -659,7 +659,7 @@ def book_slot(user_id: str, date_str: str, start_t: str, end_t: str,
         # 寫入預約記錄（完整資訊）
         hours = (end_min - start_min) // 60
         ws_records.append_row([
-            now_tw().isoformat(),
+            now_tw().strftime('%Y-%m-%dT%H:%M:%S'),
             user_id,
             name,
             contact,
@@ -818,7 +818,7 @@ def change_booking(user_id: str,
         new_slot_str = f"{new_date} {new_start}-{new_end}"
         hours = (new_end_min - new_start_min) // 60
         ws_records.append_row([
-            now_tw().isoformat(),
+            now_tw().strftime('%Y-%m-%dT%H:%M:%S'),
             user_id,
             rec_name,
             rec_contact,
@@ -1535,7 +1535,7 @@ def handle_notify(notify_user_id: str, trigger_text: str, reason: str) -> None:
     if sheet:
         try:
             sheet.append_row([
-                now_tw().isoformat(),
+                now_tw().strftime('%Y-%m-%dT%H:%M:%S'),
                 notify_user_id,
                 trigger_text[:200],
                 "知識空缺",
@@ -1702,7 +1702,7 @@ def health():
             pass
     return {
         "status": "ok",
-        "time": now_tw().isoformat(),
+        "time": now_tw().strftime('%Y-%m-%dT%H:%M:%S'),
         "redis": "connected" if redis_ok else "in-memory fallback",
         "paused_users": get_paused_count(),
         "system_prompt_length": len(get_system_prompt()),
