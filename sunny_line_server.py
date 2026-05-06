@@ -571,6 +571,45 @@ def _update_escalate_status(case_id: str, customer_id: str, new_status: str) -> 
         log.error("_update_escalate_status 失敗: %s", e)
 
 
+def _flex_action_buttons(case_id: str, customer_id: str) -> list:
+    """
+    共用直排按鈕清單（ESCALATE 卡片 + 後續訊息卡片都用同一組）。
+    直排排列，文字不截斷，不容易點錯。
+    """
+    def _pb(action: str, label: str, display: str) -> dict:
+        return {
+            "type": "postback",
+            "label": label,
+            "data": f"action={action}&case_id={case_id}&customer_id={customer_id}",
+            "displayText": display,
+        }
+
+    return [
+        {
+            "type": "button",
+            "style": "primary",
+            "color": "#2980B9",
+            "height": "sm",
+            "action": _pb("reply_customer", "📩 回覆顧客", "回覆顧客"),
+        },
+        {
+            "type": "button",
+            "style": "primary",
+            "color": "#27AE60",
+            "height": "sm",
+            "margin": "xs",
+            "action": _pb("resolve_case", "✅ 結案（恢復 AI）", "結案"),
+        },
+        {
+            "type": "button",
+            "style": "secondary",
+            "height": "sm",
+            "margin": "xs",
+            "action": _pb("mark_read", "👁 已讀", "已讀"),
+        },
+    ]
+
+
 def build_escalate_flex(
     case_id: str,
     customer_id: str,
@@ -581,27 +620,13 @@ def build_escalate_flex(
 ) -> dict:
     """
     組建 ESCALATE 通知用的 LINE Flex Message（Bubble 格式）。
-    包含顧客資訊卡片 + 三個操作按鈕：📩 回覆顧客 / ✅ 結案 / 👁 已讀
+    包含顧客資訊卡片 + 三個直排操作按鈕：📩 回覆顧客 / ✅ 結案 / 👁 已讀
     """
-    # postback data 格式：action=xxx&case_id=xxx&customer_id=xxx
-    def _pb(action: str) -> dict:
-        return {
-            "type": "postback",
-            "label": {"reply_customer": "📩 回覆顧客",
-                      "resolve_case":   "✅ 結案",
-                      "mark_read":      "👁 已讀"}.get(action, action),
-            "data": f"action={action}&case_id={case_id}&customer_id={customer_id}",
-            "displayText": {"reply_customer": "回覆顧客",
-                            "resolve_case":   "結案",
-                            "mark_read":      "已讀"}.get(action, action),
-        }
-
     short_id = customer_id[:12] + "…" if len(customer_id) > 12 else customer_id
-    short_msg = trigger_text[:80] + ("…" if len(trigger_text) > 80 else "")
+    short_msg = trigger_text[:100] + ("…" if len(trigger_text) > 100 else "")
 
     return {
         "type": "bubble",
-        "size": "kilo",
         "header": {
             "type": "box",
             "layout": "vertical",
@@ -610,7 +635,7 @@ def build_escalate_flex(
             "contents": [
                 {
                     "type": "text",
-                    "text": f"⚠️ 需要人工介入",
+                    "text": "⚠️ 需要人工介入",
                     "color": "#FFFFFF",
                     "size": "md",
                     "weight": "bold",
@@ -631,30 +656,24 @@ def build_escalate_flex(
             "paddingAll": "12px",
             "contents": [
                 {
-                    "type": "box",
-                    "layout": "baseline",
-                    "spacing": "sm",
+                    "type": "box", "layout": "baseline", "spacing": "sm",
                     "contents": [
-                        {"type": "text", "text": "顧客",   "size": "xs", "color": "#999999", "flex": 2},
+                        {"type": "text", "text": "顧客", "size": "xs", "color": "#999999", "flex": 2},
                         {"type": "text", "text": display_name, "size": "xs", "flex": 5, "wrap": True},
                     ],
                 },
                 {
-                    "type": "box",
-                    "layout": "baseline",
-                    "spacing": "sm",
+                    "type": "box", "layout": "baseline", "spacing": "sm",
                     "contents": [
-                        {"type": "text", "text": "ID",     "size": "xs", "color": "#999999", "flex": 2},
+                        {"type": "text", "text": "ID", "size": "xs", "color": "#999999", "flex": 2},
                         {"type": "text", "text": short_id, "size": "xs", "flex": 5, "wrap": True},
                     ],
                 },
                 {
-                    "type": "box",
-                    "layout": "baseline",
-                    "spacing": "sm",
+                    "type": "box", "layout": "baseline", "spacing": "sm",
                     "contents": [
-                        {"type": "text", "text": "時間",   "size": "xs", "color": "#999999", "flex": 2},
-                        {"type": "text", "text": ts,       "size": "xs", "flex": 5},
+                        {"type": "text", "text": "時間", "size": "xs", "color": "#999999", "flex": 2},
+                        {"type": "text", "text": ts, "size": "xs", "flex": 5},
                     ],
                 },
                 {"type": "separator", "margin": "sm"},
@@ -670,34 +689,84 @@ def build_escalate_flex(
         },
         "footer": {
             "type": "box",
-            "layout": "horizontal",
-            "spacing": "xs",
+            "layout": "vertical",
+            "spacing": "none",
             "paddingAll": "8px",
+            "contents": _flex_action_buttons(case_id, customer_id),
+        },
+    }
+
+
+def build_followup_flex(
+    case_id: str,
+    customer_id: str,
+    display_name: str,
+    new_message: str,
+    ts: str,
+    msg_count: int = 1,
+) -> dict:
+    """
+    組建「暫停中顧客後續訊息」通知卡片。
+    業主結案前顧客繼續傳訊息時推送，讓業主掌握最新狀況。
+    """
+    short_msg = new_message[:120] + ("…" if len(new_message) > 120 else "")
+    count_text = f"第 {msg_count} 則後續訊息" if msg_count > 1 else "後續訊息"
+
+    return {
+        "type": "bubble",
+        "header": {
+            "type": "box",
+            "layout": "vertical",
+            "backgroundColor": "#1A5276",
+            "paddingAll": "12px",
             "contents": [
                 {
-                    "type": "button",
-                    "style": "primary",
-                    "color": "#2980B9",
-                    "height": "sm",
-                    "flex": 3,
-                    "action": _pb("reply_customer"),
+                    "type": "text",
+                    "text": f"💬 顧客後續訊息",
+                    "color": "#FFFFFF",
+                    "size": "md",
+                    "weight": "bold",
                 },
                 {
-                    "type": "button",
-                    "style": "primary",
-                    "color": "#27AE60",
-                    "height": "sm",
-                    "flex": 2,
-                    "action": _pb("resolve_case"),
-                },
-                {
-                    "type": "button",
-                    "style": "secondary",
-                    "height": "sm",
-                    "flex": 2,
-                    "action": _pb("mark_read"),
+                    "type": "text",
+                    "text": f"{case_id}  ·  {display_name}  ·  {count_text}",
+                    "color": "#AED6F1",
+                    "size": "xxs",
+                    "margin": "xs",
+                    "wrap": True,
                 },
             ],
+        },
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "sm",
+            "paddingAll": "12px",
+            "contents": [
+                {
+                    "type": "box", "layout": "baseline", "spacing": "sm",
+                    "contents": [
+                        {"type": "text", "text": "時間", "size": "xs", "color": "#999999", "flex": 2},
+                        {"type": "text", "text": ts, "size": "xs", "flex": 5},
+                    ],
+                },
+                {"type": "separator", "margin": "sm"},
+                {
+                    "type": "text",
+                    "text": short_msg,
+                    "size": "sm",
+                    "wrap": True,
+                    "margin": "sm",
+                    "color": "#1C2833",
+                },
+            ],
+        },
+        "footer": {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "none",
+            "paddingAll": "8px",
+            "contents": _flex_action_buttons(case_id, customer_id),
         },
     }
 
@@ -1954,7 +2023,8 @@ def handle_escalate(escalate_user_id: str, trigger_text: str) -> None:
     ESCALATE 升級流程：
     1. 暫停該用戶的 AI 回應
     2. 寫入 Sheets 例外記錄（含觸發分類與 case_id）
-    3. Push Flex Message 卡片通知所有管理員（含操作按鈕）
+    3. 存 case_id 到 Redis（供後續訊息轉傳用）
+    4. Push Flex Message 卡片通知所有管理員（含直排操作按鈕）
     """
     paused_users.add(escalate_user_id)
     category = classify_escalate(trigger_text)
@@ -1962,6 +2032,12 @@ def handle_escalate(escalate_user_id: str, trigger_text: str) -> None:
     # 生成唯一案件 ID（ESC-MMDD-XXXXXX）
     case_id = f"ESC-{now_tw().strftime('%m%d')}-{uuid.uuid4().hex[:6].upper()}"
     log_escalate(escalate_user_id, trigger_text, case_id)
+
+    # 存 case_id 到 Redis（key: case:{user_id}，TTL 30 天）
+    r = get_redis()
+    if r:
+        r.setex(f"case:{escalate_user_id}", 86400 * 30, case_id)
+        r.setex(f"case_followup_count:{escalate_user_id}", 86400 * 30, "0")
 
     # 取得顧客顯示名稱
     profile = get_user_profile(escalate_user_id)
@@ -1983,6 +2059,57 @@ def handle_escalate(escalate_user_id: str, trigger_text: str) -> None:
 
     log.info("ESCALATE: user %s [%s] case=%s → paused + flex notified %d admin(s)",
              escalate_user_id, category, case_id, len(_admin_ids))
+
+
+def forward_paused_msg(user_id: str, new_message: str) -> None:
+    """
+    暫停中的顧客繼續傳訊息時，轉傳給所有管理員（Flex 後續訊息卡片）。
+    從 Redis 取 case_id 和後續訊息計數，推送包含最新訊息的卡片。
+    """
+    r = get_redis()
+    case_id = ""
+    msg_count = 1
+
+    if r:
+        cv = r.get(f"case:{user_id}")
+        if cv:
+            case_id = cv.decode()
+        # 累計後續訊息計數
+        cnt_key = f"case_followup_count:{user_id}"
+        try:
+            msg_count = r.incr(cnt_key)
+            r.expire(cnt_key, 86400 * 30)
+        except Exception:
+            msg_count = 1
+
+    profile = get_user_profile(user_id)
+    display_name = profile.get("displayName", user_id[:12])
+    ts = now_tw().strftime("%m/%d %H:%M")
+
+    if not case_id:
+        # Redis 沒有 case_id（可能重啟），改用純文字通知
+        for admin_id in _admin_ids:
+            line_push(admin_id,
+                f"💬 暫停顧客後續訊息\n"
+                f"顧客：{display_name}\n"
+                f"時間：{ts}\n"
+                f"訊息：{new_message[:150]}"
+            )
+        return
+
+    flex_contents = build_followup_flex(
+        case_id=case_id,
+        customer_id=user_id,
+        display_name=display_name,
+        new_message=new_message,
+        ts=ts,
+        msg_count=msg_count,
+    )
+    alt_text = f"💬 [{case_id}] {display_name}：{new_message[:30]}…"
+    for admin_id in _admin_ids:
+        line_push_flex(admin_id, alt_text, flex_contents)
+
+    log.info("forward_paused_msg: user=%s case=%s count=%d", user_id, case_id, msg_count)
 
 
 # ── 模組 7-8：Postback 按鈕事件處理（ESCALATE 卡片按鈕）─────────────────────
@@ -2122,9 +2249,9 @@ def webhook():
 
             # ── 暫停模式（模組 7-7）──────────────────────────────────────────
             if user_id in paused_users:
-                # 暫停中的用戶不觸發 AI，靜默（或視需求回一句「請稍候」）
-                log.info("User %s is paused, skipping AI response", user_id)
-                # line_reply(reply_token, "請稍候，我們的團隊將盡快與您聯繫。")
+                log.info("User %s is paused, forwarding to admin", user_id)
+                # 轉傳後續訊息給管理員（Flex 卡片，帶操作按鈕）
+                forward_paused_msg(user_id, user_text)
                 continue
 
             # ── 一般客服模式 ──────────────────────────────────────────────────
