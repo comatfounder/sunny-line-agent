@@ -100,6 +100,13 @@ CLAUDE_MODEL      = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-5")
 # Admin 專用 Rich Menu ID（由 setup_admin_rich_menu.py 建立後填入）
 ADMIN_RICH_MENU_ID = os.environ.get("ADMIN_RICH_MENU_ID", "richmenu-c4138febae9371bc555a580318301a9e")
 
+# ── Interview Mode 設定 ────────────────────────────────────────────────────────
+# 部署時在 Railway 設定以下兩個環境變數：
+#   BRAND_NAME = 小日子寫真館
+#   INDUSTRY   = 攝影寫真
+BRAND_NAME = os.environ.get("BRAND_NAME", "本品牌")
+INDUSTRY   = os.environ.get("INDUSTRY", "攝影寫真")
+
 # Sheets 分頁名稱（依客戶 Sheets 設定調整）
 SHEET_LOG       = "對話記錄"
 SHEET_SETTINGS  = "設定"
@@ -257,6 +264,7 @@ _admin_ids: set[str] = set(
 # ── Google Sheets 連線（懶載入） ──────────────────────────────────────────────
 
 _gs_workbook = None
+_interview   = None   # InterviewMode 單例（懶載入）
 
 def get_workbook():
     """取得 Google Sheets workbook，失敗回傳 None"""
@@ -290,6 +298,38 @@ def get_sheet(tab_name: str):
     except Exception as e:
         log.error("取得分頁 %s 失敗: %s", tab_name, e)
         return None
+
+
+def get_interview():
+    """
+    取得 InterviewMode 單例（懶載入）。
+    Interview Mode 需要 Redis + Sheets + Anthropic，若任一不可用則回傳 None。
+    """
+    global _interview
+    if _interview is not None:
+        return _interview
+    try:
+        import sys, os as _os
+        # 將 shared/ 目錄加入 path（部署時 interview_mode.py 複製到同目錄，此行不影響）
+        _shared = _os.path.join(_os.path.dirname(__file__), "..", "..", "shared")
+        if _os.path.isdir(_shared) and _shared not in sys.path:
+            sys.path.insert(0, _os.path.abspath(_shared))
+        from interview_mode import InterviewMode
+        r   = get_redis()
+        wb  = get_workbook()
+        ac  = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        _interview = InterviewMode(
+            redis_client=r,
+            sheets_client=wb,
+            anthropic_client=ac,
+            brand_name=BRAND_NAME,
+            industry=INDUSTRY,
+        )
+        log.info("InterviewMode 初始化完成（品牌：%s，產業：%s）", BRAND_NAME, INDUSTRY)
+    except Exception as e:
+        log.error("InterviewMode 初始化失敗：%s", e)
+        return None
+    return _interview
 
 
 def read_settings() -> dict:
@@ -1301,10 +1341,19 @@ testnotify — 測試推播通知（確認所有管理員都能收到）
 help — 顯示此說明"""
 
 
-def handle_admin(user_id: str, text: str) -> str:
+def handle_admin(user_id: str, text: str, msg_type: str = "text", img_url: str = "") -> str:
     """處理業主 admin 指令，回傳要推播給業主的回應文字"""
     text_lower = text.strip().lower()
     original = text.strip()
+
+    # ── Interview Mode（知識庫建立訪談，優先路由）────────────────────────────
+    iv = get_interview()
+    if iv is not None:
+        content = img_url if msg_type == "image" else original
+        iv_result = iv.handle(user_id, msg_type, content)
+        if iv_result is not None:
+            return iv_result
+    # Interview Mode 回傳 None 表示「此訊息不屬於訪談流程」，繼續往下走一般指令
 
     # ── status ────────────────────────────────────────────────────────────────
     if text_lower == "status":
@@ -1725,14 +1774,26 @@ def webhook():
 
         # ── 訊息事件 ──────────────────────────────────────────────────────────
         if event_type == "message":
-            msg = event.get("message", {})
-            if msg.get("type") != "text":
-                continue  # 貼圖、圖片等非文字訊息靜默忽略
+            msg      = event.get("message", {})
+            msg_type = msg.get("type", "text")
 
             user_id     = event["source"]["userId"]
             reply_token = event["replyToken"]
-            user_text   = msg["text"].strip()
 
+            # ── 圖片訊息：只有 admin 在訪談模式中才處理，其餘靜默忽略 ──────
+            if msg_type == "image":
+                if is_admin(user_id):
+                    img_id  = msg.get("id", "")
+                    img_url = f"https://api-data.line.me/v2/bot/message/{img_id}/content"
+                    response = handle_admin(user_id, "", msg_type="image", img_url=img_url)
+                    line_push(user_id, response)
+                continue  # 非 admin 的圖片靜默忽略
+
+            # 非文字、非圖片（貼圖、影片等）：靜默忽略
+            if msg_type != "text":
+                continue
+
+            user_text = msg["text"].strip()
             log.info("MSG from %s: %s", user_id, user_text[:80])
 
             # ── 一次性密碼認領（任何人皆可觸發，成功後加入管理員）────────────
@@ -1751,9 +1812,9 @@ def webhook():
                 # 密碼訊息不寫入 Sheets，直接 continue
                 continue
 
-            # ── Admin 模式（模組 7-3）────────────────────────────────────────
+            # ── Admin 模式（模組 7-3，含 Interview Mode）─────────────────────
             if is_admin(user_id):
-                response = handle_admin(user_id, user_text)
+                response = handle_admin(user_id, user_text, msg_type="text")
                 # Admin 回應用 Push（避免超過 5 秒 webhook timeout）
                 line_push(user_id, response)
                 continue
