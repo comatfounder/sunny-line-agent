@@ -11,6 +11,7 @@ LINE OA AI 客服 Template Server
   7-5  每日自動報告（APScheduler）
   7-6  提示詞更新確認流程（update prompt → confirm/cancel）
   7-7  ESCALATE 例外升級 + pause/resume + relay mode
+  7-8  Flex Message 通知卡片 + Postback 按鈕（回覆顧客/結案/已讀）
 
 啟動方式（本機開發）：
   1. cp .env.example .env  並填入環境變數
@@ -34,6 +35,7 @@ LINE OA AI 客服 Template Server
 import os
 import re
 import json
+import uuid
 import hashlib
 import hmac
 import base64
@@ -529,8 +531,8 @@ def classify_escalate(trigger_text: str) -> str:
     return "其他"
 
 
-def log_escalate(user_id: str, trigger_text: str) -> None:
-    """將 ESCALATE 事件寫入例外記錄分頁（含觸發分類）"""
+def log_escalate(user_id: str, trigger_text: str, case_id: str = "") -> None:
+    """將 ESCALATE 事件寫入例外記錄分頁（含觸發分類與 case_id）"""
     sheet = get_sheet(SHEET_ESCALATE)
     if sheet is None:
         return
@@ -542,10 +544,162 @@ def log_escalate(user_id: str, trigger_text: str) -> None:
             trigger_text,
             category,
             "未處理",
-            "",
+            case_id,
         ])
     except Exception as e:
         log.error("Sheets 例外記錄寫入失敗: %s", e)
+
+
+def _update_escalate_status(case_id: str, customer_id: str, new_status: str) -> None:
+    """更新例外記錄分頁中特定案件的狀態（以 case_id 優先，次用 customer_id）"""
+    sheet = get_sheet(SHEET_ESCALATE)
+    if sheet is None:
+        return
+    try:
+        rows = sheet.get_all_values()
+        for i, row in enumerate(rows[1:], start=2):  # 跳過標題，Sheets 列號從 1 起
+            # 優先用 case_id 比對（第 6 欄，index 5）
+            matched_by_case = (case_id and len(row) >= 6 and row[5] == case_id)
+            # 次用 customer_id + 未處理狀態比對（第 2 欄 index 1, 第 5 欄 index 4）
+            matched_by_uid  = (not case_id and len(row) >= 5
+                               and row[1] == customer_id and row[4] == "未處理")
+            if matched_by_case or matched_by_uid:
+                sheet.update_cell(i, 5, new_status)  # col 5 = 狀態
+                log.info("例外記錄 %s 狀態更新→%s (row %d)", case_id or customer_id, new_status, i)
+                return
+    except Exception as e:
+        log.error("_update_escalate_status 失敗: %s", e)
+
+
+def build_escalate_flex(
+    case_id: str,
+    customer_id: str,
+    display_name: str,
+    category: str,
+    trigger_text: str,
+    ts: str,
+) -> dict:
+    """
+    組建 ESCALATE 通知用的 LINE Flex Message（Bubble 格式）。
+    包含顧客資訊卡片 + 三個操作按鈕：📩 回覆顧客 / ✅ 結案 / 👁 已讀
+    """
+    # postback data 格式：action=xxx&case_id=xxx&customer_id=xxx
+    def _pb(action: str) -> dict:
+        return {
+            "type": "postback",
+            "label": {"reply_customer": "📩 回覆顧客",
+                      "resolve_case":   "✅ 結案",
+                      "mark_read":      "👁 已讀"}.get(action, action),
+            "data": f"action={action}&case_id={case_id}&customer_id={customer_id}",
+            "displayText": {"reply_customer": "回覆顧客",
+                            "resolve_case":   "結案",
+                            "mark_read":      "已讀"}.get(action, action),
+        }
+
+    short_id = customer_id[:12] + "…" if len(customer_id) > 12 else customer_id
+    short_msg = trigger_text[:80] + ("…" if len(trigger_text) > 80 else "")
+
+    return {
+        "type": "bubble",
+        "size": "kilo",
+        "header": {
+            "type": "box",
+            "layout": "vertical",
+            "backgroundColor": "#C0392B",
+            "paddingAll": "12px",
+            "contents": [
+                {
+                    "type": "text",
+                    "text": f"⚠️ 需要人工介入",
+                    "color": "#FFFFFF",
+                    "size": "md",
+                    "weight": "bold",
+                },
+                {
+                    "type": "text",
+                    "text": f"{case_id}  ·  {category}",
+                    "color": "#F5B7B1",
+                    "size": "xxs",
+                    "margin": "xs",
+                },
+            ],
+        },
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "sm",
+            "paddingAll": "12px",
+            "contents": [
+                {
+                    "type": "box",
+                    "layout": "baseline",
+                    "spacing": "sm",
+                    "contents": [
+                        {"type": "text", "text": "顧客",   "size": "xs", "color": "#999999", "flex": 2},
+                        {"type": "text", "text": display_name, "size": "xs", "flex": 5, "wrap": True},
+                    ],
+                },
+                {
+                    "type": "box",
+                    "layout": "baseline",
+                    "spacing": "sm",
+                    "contents": [
+                        {"type": "text", "text": "ID",     "size": "xs", "color": "#999999", "flex": 2},
+                        {"type": "text", "text": short_id, "size": "xs", "flex": 5, "wrap": True},
+                    ],
+                },
+                {
+                    "type": "box",
+                    "layout": "baseline",
+                    "spacing": "sm",
+                    "contents": [
+                        {"type": "text", "text": "時間",   "size": "xs", "color": "#999999", "flex": 2},
+                        {"type": "text", "text": ts,       "size": "xs", "flex": 5},
+                    ],
+                },
+                {"type": "separator", "margin": "sm"},
+                {
+                    "type": "text",
+                    "text": short_msg,
+                    "size": "xs",
+                    "wrap": True,
+                    "margin": "sm",
+                    "color": "#333333",
+                },
+            ],
+        },
+        "footer": {
+            "type": "box",
+            "layout": "horizontal",
+            "spacing": "xs",
+            "paddingAll": "8px",
+            "contents": [
+                {
+                    "type": "button",
+                    "style": "primary",
+                    "color": "#2980B9",
+                    "height": "sm",
+                    "flex": 3,
+                    "action": _pb("reply_customer"),
+                },
+                {
+                    "type": "button",
+                    "style": "primary",
+                    "color": "#27AE60",
+                    "height": "sm",
+                    "flex": 2,
+                    "action": _pb("resolve_case"),
+                },
+                {
+                    "type": "button",
+                    "style": "secondary",
+                    "height": "sm",
+                    "flex": 2,
+                    "action": _pb("mark_read"),
+                },
+            ],
+        },
+    }
 
 
 # ── LINE API 工具 ─────────────────────────────────────────────────────────────
@@ -592,6 +746,46 @@ def line_push(user_id: str, text: str) -> None:
         log.error("LINE Push API error %s: %s", resp.status_code, resp.text)
     else:
         log.info("Push sent to %s: %s", user_id, text[:60])
+
+
+def line_push_flex(user_id: str, alt_text: str, flex_contents: dict) -> None:
+    """透過 LINE Push API 推送 Flex Message（卡片 / 按鈕）"""
+    if not user_id or not LINE_CHANNEL_ACCESS_TOKEN:
+        return
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+    }
+    payload = {
+        "to": user_id,
+        "messages": [{
+            "type": "flex",
+            "altText": alt_text,
+            "contents": flex_contents,
+        }],
+    }
+    resp = requests.post(LINE_PUSH_URL, headers=headers, json=payload, timeout=10)
+    if not resp.ok:
+        log.error("LINE Push Flex API error %s: %s", resp.status_code, resp.text)
+    else:
+        log.info("Flex push sent to %s", user_id)
+
+
+def get_user_profile(user_id: str) -> dict:
+    """從 LINE API 取得用戶基本資料（displayName 等），失敗回傳空 dict"""
+    if not user_id or not LINE_CHANNEL_ACCESS_TOKEN:
+        return {}
+    try:
+        resp = requests.get(
+            f"https://api.line.me/v2/bot/profile/{user_id}",
+            headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"},
+            timeout=5,
+        )
+        if resp.ok:
+            return resp.json()
+    except Exception as e:
+        log.warning("get_user_profile 失敗: %s", e)
+    return {}
 
 
 def link_rich_menu(user_id: str, rich_menu_id: str) -> None:
@@ -1346,6 +1540,34 @@ def handle_admin(user_id: str, text: str, msg_type: str = "text", img_url: str =
     text_lower = text.strip().lower()
     original = text.strip()
 
+    # ── Relay Mode 攔截（最優先，postback 按鈕觸發後的下一則訊息）─────────────
+    # 只攔截文字訊息（圖片不觸發 relay）
+    if msg_type == "text" and original:
+        relay_val = None
+        r = get_redis()
+        if r:
+            rv = r.get(f"relay_to:{user_id}")
+            if rv:
+                relay_val = rv.decode()
+                r.delete(f"relay_to:{user_id}")  # 一次性，立即清除
+        elif user_id in _relay_mode_fallback:
+            relay_val = _relay_mode_fallback.pop(user_id)
+
+        if relay_val:
+            # relay_val 格式：customer_id:case_id
+            parts = relay_val.split(":", 1)
+            target_id = parts[0]
+            case_id   = parts[1] if len(parts) > 1 else ""
+            line_push(target_id, original)
+            log_conversation(target_id, "[業主 relay]", original, "RELAY")
+            profile = get_user_profile(target_id)
+            name_hint = profile.get("displayName", target_id[:12])
+            return (
+                f"✅ 已傳送給 {name_hint}\n"
+                f"案件：{case_id}\n"
+                f"Relay 模式已自動退出。"
+            )
+
     # ── Interview Mode（知識庫建立訪談，優先路由）────────────────────────────
     iv = get_interview()
     if iv is not None:
@@ -1731,26 +1953,105 @@ def handle_escalate(escalate_user_id: str, trigger_text: str) -> None:
     """
     ESCALATE 升級流程：
     1. 暫停該用戶的 AI 回應
-    2. 寫入 Sheets 例外記錄（含觸發分類）
-    3. Push 通知所有管理員
+    2. 寫入 Sheets 例外記錄（含觸發分類與 case_id）
+    3. Push Flex Message 卡片通知所有管理員（含操作按鈕）
     """
     paused_users.add(escalate_user_id)
     category = classify_escalate(trigger_text)
-    log_escalate(escalate_user_id, trigger_text)
 
-    notify = (
-        f"⚠️ 需要人工介入\n"
-        f"分類：{category}\n"
-        f"觸發訊息：{trigger_text[:80]}\n"
-        f"用戶ID：{escalate_user_id}\n\n"
-        f"AI 回應已暫停，可用指令：\n"
-        f"reply {escalate_user_id} [你的回覆]\n"
-        f"resume {escalate_user_id}"
+    # 生成唯一案件 ID（ESC-MMDD-XXXXXX）
+    case_id = f"ESC-{now_tw().strftime('%m%d')}-{uuid.uuid4().hex[:6].upper()}"
+    log_escalate(escalate_user_id, trigger_text, case_id)
+
+    # 取得顧客顯示名稱
+    profile = get_user_profile(escalate_user_id)
+    display_name = profile.get("displayName", escalate_user_id[:12])
+    ts = now_tw().strftime("%m/%d %H:%M")
+
+    flex_contents = build_escalate_flex(
+        case_id=case_id,
+        customer_id=escalate_user_id,
+        display_name=display_name,
+        category=category,
+        trigger_text=trigger_text,
+        ts=ts,
     )
+    alt_text = f"⚠️ 需要人工介入 [{category}] — {display_name}"
+
     for admin_id in _admin_ids:
-        line_push(admin_id, notify)
-    log.info("ESCALATE: user %s [%s] → paused + notified %d admin(s)",
-             escalate_user_id, category, len(_admin_ids))
+        line_push_flex(admin_id, alt_text, flex_contents)
+
+    log.info("ESCALATE: user %s [%s] case=%s → paused + flex notified %d admin(s)",
+             escalate_user_id, category, case_id, len(_admin_ids))
+
+
+# ── 模組 7-8：Postback 按鈕事件處理（ESCALATE 卡片按鈕）─────────────────────
+
+def handle_postback(admin_id: str, data: str) -> None:
+    """
+    處理管理員點擊 Flex Message 按鈕觸發的 postback 事件。
+
+    支援動作：
+      reply_customer — 啟動 relay mode（一次性，下一則訊息自動轉發給顧客）
+      resolve_case   — 結案（更新 Sheets 狀態為「已處理」，恢復 AI 回應）
+      mark_read      — 標記已讀（更新 Sheets 狀態為「已讀」）
+
+    data 格式：action=xxx&case_id=ESC-XXXX&customer_id=Uxxxxx
+    """
+    # 解析 querystring 風格的 postback data
+    params = {}
+    for part in data.split("&"):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            params[k.strip()] = v.strip()
+
+    action      = params.get("action", "")
+    case_id     = params.get("case_id", "")
+    customer_id = params.get("customer_id", "")
+
+    if action == "reply_customer":
+        # 設定 relay mode：Redis key = relay_to:{admin_id}，value = customer_id:case_id
+        r = get_redis()
+        relay_val = f"{customer_id}:{case_id}"
+        if r:
+            r.setex(f"relay_to:{admin_id}", 3600, relay_val)  # TTL 1 小時
+        else:
+            # fallback：in-memory dict（重啟失效，但 Railway 環境應有 Redis）
+            _relay_mode_fallback[admin_id] = relay_val
+
+        name_hint = customer_id[:12]
+        profile = get_user_profile(customer_id)
+        if profile.get("displayName"):
+            name_hint = profile["displayName"]
+
+        line_push(admin_id,
+            f"📩 Relay 模式啟動\n"
+            f"顧客：{name_hint}\n"
+            f"案件：{case_id}\n\n"
+            f"直接輸入要傳給顧客的訊息，只傳一則，傳送後自動退出 Relay 模式。"
+        )
+        log.info("Relay mode set: admin=%s → customer=%s case=%s", admin_id, customer_id, case_id)
+
+    elif action == "resolve_case":
+        _update_escalate_status(case_id, customer_id, "已處理")
+        resume_user(customer_id)
+        line_push(admin_id,
+            f"✅ 案件 {case_id} 已結案\n"
+            f"顧客 AI 回應已恢復。"
+        )
+        log.info("Resolve case: admin=%s case=%s customer=%s", admin_id, case_id, customer_id)
+
+    elif action == "mark_read":
+        _update_escalate_status(case_id, customer_id, "已讀")
+        line_push(admin_id, f"👁 案件 {case_id} 已標記為已讀。")
+        log.info("Mark read: admin=%s case=%s", admin_id, case_id)
+
+    else:
+        log.warning("未知 postback action: %s from admin %s", action, admin_id)
+
+
+# relay mode in-memory fallback（Redis 不可用時備用）
+_relay_mode_fallback: dict = {}
 
 
 # ── Webhook 路由 ──────────────────────────────────────────────────────────────
@@ -1839,6 +2140,15 @@ def webhook():
             # ── ESCALATE 處理（模組 7-7，硬升級）────────────────────────────────
             elif status == "ESCALATE":
                 handle_escalate(user_id, user_text)
+
+        # ── Postback 事件（Flex Message 按鈕，模組 7-8）──────────────────────
+        elif event_type == "postback":
+            user_id = event["source"]["userId"]
+            pb_data = event.get("postback", {}).get("data", "")
+            if is_admin(user_id) and pb_data:
+                handle_postback(user_id, pb_data)
+            else:
+                log.warning("Postback from non-admin or empty data: %s", user_id)
 
         # ── 加入好友事件 ──────────────────────────────────────────────────────
         elif event_type == "follow":
