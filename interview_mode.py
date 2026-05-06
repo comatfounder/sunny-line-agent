@@ -193,15 +193,22 @@ class InterviewMode:
         # 初始化 Sheets（訪談記錄 / 問題庫 兩個分頁）
         self._init_sheets(questions)
 
-        total = len(questions)
-        first_q = questions[0]
+        modules  = self._get_modules(questions)
+        mod_list = "\n".join(
+            f"  {self._module_emoji(i)} {m['name']}"
+            for i, m in enumerate(modules)
+        )
+        first_q   = questions[0]
+        mod_intro = self._format_module_intro(modules[0], 0, questions)
+
         return (
             f"好的！現在開始為【{self.brand}】建立知識庫 📋\n\n"
-            f"共 {total} 題（實際題數可能因服務品項數量而增加）。\n"
-            f"你可以分多次完成，中途說「今天先到這裡」儲存進度。\n"
-            f"每題回答完畢後，輸入「下一題」我就會整理你的回答並繼續。\n\n"
-            f"─────────────────\n"
-            f"{self._format_question(first_q, 1, total)}"
+            f"我會分 {len(modules)} 個主題問你，不需要一次做完。\n"
+            f"說「今天先到這裡」隨時暫停，下次「繼續建立知識庫」接著做。\n"
+            f"每題回答完後輸入「下一題」繼續。\n\n"
+            f"主題一覽：\n{mod_list}\n\n"
+            f"{mod_intro}\n"
+            f"{self._format_question(first_q, questions)}"
         )
 
     def _cmd_resume(self, user_id: str) -> str:
@@ -223,11 +230,15 @@ class InterviewMode:
             )
 
         current_q = questions[q_index]
-        done = q_index
+        modules   = self._get_modules(questions)
+        cur_mod   = {"id": current_q["module"], "name": current_q["module_name"]}
+        mod_idx   = next((i for i, m in enumerate(modules) if m["id"] == cur_mod["id"]), 0)
+        mod_intro = self._format_module_intro(cur_mod, mod_idx, questions)
+        done_pct  = int(q_index / len(questions) * 100)
         return (
-            f"繼續！目前進度：{done}/{total} 題已完成。\n\n"
-            f"─────────────────\n"
-            f"{self._format_question(current_q, q_index + 1, total)}"
+            f"繼續！整體進度 {done_pct}%。\n\n"
+            f"{mod_intro}\n"
+            f"{self._format_question(current_q, questions)}"
         )
 
     def _cmd_next(self, user_id: str, state: dict) -> str:
@@ -245,7 +256,7 @@ class InterviewMode:
         if not buffer:
             return (
                 f"你還沒有回答這題喔！\n\n"
-                f"{self._format_question(current_q, q_index + 1, total)}\n\n"
+                f"{self._format_question(current_q, questions)}\n\n"
                 f"回答完後輸入「下一題」繼續。"
             )
 
@@ -295,38 +306,65 @@ class InterviewMode:
                 for idx, q in enumerate(state["questions"]):
                     q["id"] = str(idx + 1)
 
-                total = len(state["questions"])
                 svc_list = "、".join(services)
                 self._save(user_id, state)
-                next_q = state["questions"][state["q_index"]]
+                next_q    = state["questions"][state["q_index"]]
+                modules   = self._get_modules(state["questions"])
+                mod_idx   = next((i for i, m in enumerate(modules) if m["id"] == next_q["module"]), 0)
+                mod_intro = self._format_module_intro(
+                    {"id": next_q["module"], "name": next_q["module_name"]},
+                    mod_idx, state["questions"]
+                )
                 return (
                     f"✅ 收到！我記下了這些服務品項：\n{svc_list}\n\n"
-                    f"我會逐一詢問每個服務的詳細資訊（每項 5 題）。\n"
-                    f"現在共 {total} 題。\n\n"
-                    f"─────────────────\n"
-                    f"{self._format_question(next_q, state['q_index'] + 1, total)}"
+                    f"接下來我會逐一詢問每個服務的詳細資訊（每項 5 題）。\n\n"
+                    f"{mod_intro}\n"
+                    f"{self._format_question(next_q, state['questions'])}"
                 )
 
         self._save(user_id, state)
 
         # 下一題
         new_index = state["q_index"]
-        new_total = len(state["questions"])
+        questions = state["questions"]   # 可能因 M2 展開而更新
+        new_total = len(questions)
 
         if new_index >= new_total:
             return (
-                f"✅ 第 {q_index + 1} 題完成！\n\n"
-                f"🎉 所有 {new_total} 題都回答完了！\n"
+                f"✅ 完成！\n\n"
+                f"🎉 所有主題都回答完了！\n"
                 f"輸入「生成知識庫」讓我把你的答案整理成完整知識庫初稿。"
             )
 
-        next_q = state["questions"][new_index]
-        done   = new_index
-        return (
-            f"✅ 第 {q_index + 1} 題完成！（{done}/{new_total}）\n\n"
-            f"─────────────────\n"
-            f"{self._format_question(next_q, new_index + 1, new_total)}"
-        )
+        next_q        = questions[new_index]
+        modules       = self._get_modules(questions)
+        prev_mod_id   = current_q["module"]
+        next_mod_id   = next_q["module"]
+
+        # 判斷是否跨模組
+        if prev_mod_id != next_mod_id:
+            # 跨模組：顯示完成慶賀 + 新模組開場
+            prev_mod_idx = next((i for i, m in enumerate(modules) if m["id"] == prev_mod_id), 0)
+            next_mod_idx = next((i for i, m in enumerate(modules) if m["id"] == next_mod_id), 0)
+            completion   = self._module_completion_msg(
+                {"id": prev_mod_id, "name": current_q["module_name"]},
+                prev_mod_idx, modules
+            )
+            mod_intro = self._format_module_intro(
+                {"id": next_mod_id, "name": next_q["module_name"]},
+                next_mod_idx, questions
+            )
+            return (
+                f"{completion}\n"
+                f"{mod_intro}\n"
+                f"{self._format_question(next_q, questions)}"
+            )
+        else:
+            # 同模組，繼續下一題
+            return (
+                f"✅ 收到！\n\n"
+                f"{self._format_question(next_q, questions)}"
+            )
 
     def _cmd_skip(self, user_id: str, state: dict) -> str:
         questions = state["questions"]
@@ -349,56 +387,78 @@ class InterviewMode:
         self._save(user_id, state)
 
         new_index = state["q_index"]
-        if new_index >= total:
-            return f"✅ 第 {q_index + 1} 題已跳過。所有題目完成！輸入「生成知識庫」。"
+        questions = state["questions"]
+        if new_index >= len(questions):
+            return "⏭ 已跳過。所有主題都完成了！輸入「生成知識庫」。"
 
-        next_q = state["questions"][new_index]
+        next_q = questions[new_index]
         return (
-            f"⏭ 已跳過第 {q_index + 1} 題。\n\n"
-            f"─────────────────\n"
-            f"{self._format_question(next_q, new_index + 1, total)}"
+            f"⏭ 已跳過。\n\n"
+            f"{self._format_question(next_q, questions)}"
         )
 
     def _cmd_pause(self, user_id: str, state: dict) -> str:
         questions = state["questions"]
         q_index   = state["q_index"]
-        total     = len(questions)
-        done      = q_index
+        modules   = self._get_modules(questions)
+        done_pct  = int(q_index / max(len(questions), 1) * 100)
 
         state["active"]     = False
         state["updated_at"] = now_tw().isoformat()
         self._save(user_id, state)
 
+        # 找到目前停在哪個主題
+        if q_index < len(questions):
+            cur_q     = questions[q_index]
+            mod_idx   = next((i for i, m in enumerate(modules) if m["id"] == cur_q["module"]), 0)
+            cur_emoji = self._module_emoji(mod_idx)
+            cur_name  = cur_q["module_name"]
+            cur_info  = f"停在第 {cur_emoji} 主題【{cur_name}】"
+        else:
+            cur_info = "全部完成"
+
         return (
             f"好的！進度已儲存 💾\n\n"
-            f"目前完成：{done}/{total} 題\n"
-            f"剩餘：{total - done} 題\n\n"
-            f"下次輸入「繼續建立知識庫」從第 {done + 1} 題繼續。"
+            f"整體進度：{done_pct}%\n"
+            f"{cur_info}\n\n"
+            f"下次輸入「繼續建立知識庫」接著做。"
         )
 
     def _cmd_status(self, user_id: str, state: dict) -> str:
         questions = state["questions"]
         q_index   = state["q_index"]
-        total     = len(questions)
-        done      = q_index
+        modules   = self._get_modules(questions)
 
-        skipped = sum(
-            1 for v in state.get("answers", {}).values()
-            if v.get("raw") == "(跳過)"
-        )
-        answered = done - skipped
+        skipped  = sum(1 for v in state.get("answers", {}).values() if v.get("raw") == "(跳過)")
+        answered = q_index - skipped
+        done_pct = int(q_index / max(len(questions), 1) * 100)
 
-        if done >= total:
+        # 已完成的模組 vs 尚未完成的模組
+        completed_mods = []
+        remaining_mods = []
+        for i, m in enumerate(modules):
+            mod_qs    = [q for q in questions if q["module"] == m["id"]]
+            first_idx = questions.index(mod_qs[0])
+            last_idx  = questions.index(mod_qs[-1])
+            if last_idx < q_index:
+                completed_mods.append(f"  ✅ {self._module_emoji(i)} {m['name']}")
+            elif first_idx <= q_index:
+                remaining_mods.append(f"  🔄 {self._module_emoji(i)} {m['name']}（進行中）")
+            else:
+                remaining_mods.append(f"  ⬜ {self._module_emoji(i)} {m['name']}")
+
+        if q_index >= len(questions):
             return (
                 f"📋 訪談進度：全部完成！✅\n"
-                f"共 {total} 題，回答 {answered} 題，跳過 {skipped} 題。\n\n"
+                f"回答 {answered} 題，跳過 {skipped} 題。\n\n"
                 f"輸入「生成知識庫」產出初稿。"
             )
 
+        mod_status = "\n".join(completed_mods + remaining_mods)
         return (
-            f"📋 訪談進度：{done}/{total} 題\n"
-            f"已回答：{answered} 題  |  已跳過：{skipped} 題  |  剩餘：{total - done} 題\n\n"
-            f"目前停在：Q{done + 1}. {questions[q_index]['question'][:40]}…\n\n"
+            f"📋 訪談進度：{done_pct}%\n"
+            f"已回答：{answered} 題  |  已跳過：{skipped} 題\n\n"
+            f"主題進度：\n{mod_status}\n\n"
             f"輸入「下一題」繼續，或「今天先到這裡」儲存進度。"
         )
 
@@ -416,10 +476,9 @@ class InterviewMode:
 
         target_q = questions[q_num - 1]
         return (
-            f"↩️ 回到第 {q_num} 題重新作答。\n\n"
-            f"─────────────────\n"
-            f"{self._format_question(target_q, q_num, total)}\n\n"
-            f"（之前的答案已清除，回答完後輸入「下一題」繼續）"
+            f"↩️ 重新作答：\n\n"
+            f"{self._format_question(target_q, questions)}\n\n"
+            f"（回答完後輸入「下一題」繼續）"
         )
 
     def _cmd_generate(self, user_id: str, state: dict) -> str:
@@ -622,14 +681,67 @@ class InterviewMode:
     # ── 格式化 ────────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _format_question(q: dict, num: int, total: int) -> str:
-        required_tag = "" if q.get("required", True) else "（選填）"
-        hint = f"\n💡 {q['hint']}" if q.get("hint") else ""
+    def _module_progress(q: dict, all_questions: list) -> tuple:
+        """
+        計算題目在當前模組中的位置。
+        回傳 (module_q_num, module_total) — 例如 (3, 7) 表示此模組第 3/7 題。
+        """
+        module_id = q["module"]
+        module_qs = [qq for qq in all_questions if qq["module"] == module_id]
+        try:
+            pos = module_qs.index(q) + 1
+        except ValueError:
+            pos = 1
+        return pos, len(module_qs)
+
+    @staticmethod
+    def _get_modules(questions: list) -> list:
+        """
+        從問題清單中提取模組順序（去重，保留順序）。
+        回傳 [{"id": "M1", "name": "品牌基本資訊"}, ...]
+        """
+        seen = {}
+        modules = []
+        for q in questions:
+            mid = q["module"]
+            if mid not in seen:
+                seen[mid] = True
+                modules.append({"id": mid, "name": q["module_name"]})
+        return modules
+
+    @staticmethod
+    def _module_emoji(module_index: int) -> str:
+        """把模組 index（0-based）轉成圓圈數字 emoji。"""
+        circles = ["①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨", "⑩"]
+        return circles[module_index] if module_index < len(circles) else f"({module_index + 1})"
+
+    def _format_question(self, q: dict, all_questions: list) -> str:
+        """
+        格式化單題問題顯示。
+        使用模組內進度（例：3/7），不顯示總題數。
+        """
+        mod_num, mod_total = self._module_progress(q, all_questions)
+        required_tag = "（選填）" if not q.get("required", True) else ""
+        hint      = f"\n💡 {q['hint']}" if q.get("hint") else ""
         media_tag = "\n📎 可以直接傳圖給我" if q.get("type") == "media" else ""
 
         return (
-            f"Q{num}/{total}. 【{q['module_name']}】{required_tag}\n"
+            f"【{q['module_name']}】{mod_num}/{mod_total} {required_tag}\n"
             f"{q['question']}"
             f"{hint}"
             f"{media_tag}"
         )
+
+    def _format_module_intro(self, module: dict, module_index: int, all_questions: list) -> str:
+        """模組開場白，進入新模組時顯示。"""
+        emoji    = self._module_emoji(module_index)
+        mid      = module["id"]
+        mod_qs   = [q for q in all_questions if q["module"] == mid]
+        count    = len(mod_qs)
+        return f"─────────────────\n第 {emoji} 主題：{module['name']}（{count} 題）\n"
+
+    def _module_completion_msg(self, module: dict, module_index: int, modules: list) -> str:
+        """模組完成時的慶賀訊息。"""
+        emoji    = self._module_emoji(module_index)
+        done_pct = int((module_index + 1) / len(modules) * 100)
+        return f"✅ 第 {emoji} 主題【{module['name']}】完成！（整體進度 {done_pct}%）\n"
