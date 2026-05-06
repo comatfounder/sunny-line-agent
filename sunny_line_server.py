@@ -1617,7 +1617,7 @@ def handle_admin(user_id: str, text: str, msg_type: str = "text", img_url: str =
         if r:
             rv = r.get(f"relay_to:{user_id}")
             if rv:
-                relay_val = rv.decode()
+                relay_val = rv.decode() if isinstance(rv, bytes) else rv
                 r.delete(f"relay_to:{user_id}")  # 一次性，立即清除
         elif user_id in _relay_mode_fallback:
             relay_val = _relay_mode_fallback.pop(user_id)
@@ -2073,7 +2073,7 @@ def forward_paused_msg(user_id: str, new_message: str) -> None:
     if r:
         cv = r.get(f"case:{user_id}")
         if cv:
-            case_id = cv.decode()
+            case_id = cv.decode() if isinstance(cv, bytes) else cv
         # 累計後續訊息計數
         cnt_key = f"case_followup_count:{user_id}"
         try:
